@@ -63,6 +63,21 @@ class ProblemSetup(ABC, Generic[D]):
         """The name of the layer from which to extract features for the GP."""
         raise NotImplementedError
 
+    def is_solved(self, batch: Batch[D]) -> bool:
+        """Whether an exploration batch has solved the problem, e.g., reached a target region. Only
+        used to stop exploration early when `stop_when_solved` is set.
+
+        Parameters
+        ----------
+        batch : Batch[D]
+            The sample.
+        Returns
+        -------
+        bool
+            Whether the problem is solved.
+        """
+        return False
+
     def postprocess_latents(self, batch: Batch[D]) -> D:
         """Post-process latents generated from the base model.
 

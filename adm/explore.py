@@ -1,4 +1,4 @@
-from typing import Generic, Literal
+from typing import Generic, Literal, Any
 from dataclasses import dataclass
 from contextlib import contextmanager
 
@@ -60,6 +60,8 @@ class ExploreConfig:
     # Flags
     no_uncertainty: bool = False
     no_verifier: bool = False
+    stop_when_solved: bool = False
+    no_visualize: bool = False
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -238,10 +240,12 @@ class ExploreLoop(Generic[D]):
 
         return metrics
 
-    def explore_loop(self, num_iterations: int, samples_per_iter: int):
+    def explore_loop(self, num_iterations: int, samples_per_iter: int) -> dict[str, Any]:
         metrics = dict()
         batches: list[Batch[D]] = []
+        total_samples = 0
         total_valid_samples = 0
+        samples_to_solve = None
 
         for i in range(num_iterations):
             # Evaluate current model state
@@ -263,7 +267,11 @@ class ExploreLoop(Generic[D]):
                 batch = Batch.from_sample(sample)
                 batch.latents = self.problem.postprocess_latents(batch)
                 batch.valids = self.problem.validity(batch.samples, batch.kwargs)
+                total_samples += len(batch)
                 total_valid_samples += batch.valids.int().sum().item()
+                solved = self.problem.is_solved(batch)
+                if solved and samples_to_solve is None:
+                    samples_to_solve = total_samples
 
                 self.env.control_policy = None
 
@@ -272,7 +280,8 @@ class ExploreLoop(Generic[D]):
 
             # Logging and visualization
             with self._timer("visualize"):
-                self.visualize_iter(batch, i)
+                if not self.config.no_visualize:
+                    self.visualize_iter(batch, i)
 
                 with torch.no_grad():
                     mean, uncert = self.uncertainty.mean_and_uncertainty(batch.latents, **batch.kwargs)
@@ -308,15 +317,33 @@ class ExploreLoop(Generic[D]):
             # Write timings to CSV
             self._flush_timings(i)
 
+            if solved and self.config.stop_when_solved:
+                self.logger.info(f"solved at iteration {i} after {total_samples} samples")
+                break
+
         write_video(
             sorted(self.config.folder.glob("frames/*.png")),
             self.config.folder / "video.mp4",
             fps=self.config.video_fps,
         )
 
+        return {
+            "iterations": i + 1,
+            "num_samples": total_samples,
+            "num_valid_samples": total_valid_samples,
+            "solved": samples_to_solve is not None,
+            "samples_to_solve": samples_to_solve,
+        }
+
 
 def setup_and_run(args: argparse.Namespace, reward: Reward, mean_weight: float):
     """Shared initialization and run logic for task-agnostic and task-directed."""
+    loop = build_loop(args, reward, mean_weight)
+    loop.explore_loop(loop.config.num_iters, loop.config.samples_per_iter)
+
+
+def build_loop(args: argparse.Namespace, reward: Reward, mean_weight: float) -> ExploreLoop:
+    """Shared initialization logic for task-agnostic and task-directed."""
     if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
@@ -361,8 +388,7 @@ def setup_and_run(args: argparse.Namespace, reward: Reward, mean_weight: float):
     logger = setup_logger(config.folder, args.verbose)
     logger.info("starting...")
 
-    loop = ExploreLoop(problem_setup=problem_setup, uncertainty=uncertainty, reward=reward, config=config, logger=logger)
-    loop.explore_loop(config.num_iters, config.samples_per_iter)
+    return ExploreLoop(problem_setup=problem_setup, uncertainty=uncertainty, reward=reward, config=config, logger=logger)
 
 
 def build_parser(add_extra_args):
@@ -427,3 +453,5 @@ def add_global_args(parser):
 
     # Logging
     parser.add_argument("--video_fps", type=int, default=4)
+    parser.add_argument("--no_visualize", action="store_true")
+    parser.add_argument("--stop_when_solved", action="store_true")
