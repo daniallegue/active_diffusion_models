@@ -223,3 +223,6 @@ __marimo__/
 experiments/
 slurm-*
 *.ipynb
+
+# reports
+reports/

@@ -29,6 +29,7 @@ from matplotlib.patches import Rectangle
 from diffusiongym import DummyReward
 from pathlib import Path
 
+from ..abe import ABELoop, ABEConfig, add_abe_args
 from ..explore import build_loop, add_global_args
 from ..setups.corridor import CorridorProblemSetup
 from ..uncertainty import uncertainty_estimators
@@ -60,7 +61,10 @@ def run_cell(args: argparse.Namespace, w: float, l: float, seed: int):
     })
 
     t0 = time.perf_counter()
-    loop = build_loop(cell_args, reward=DummyReward(), mean_weight=0)
+    if args.method == "abe":
+        loop = build_loop(cell_args, reward=DummyReward(), mean_weight=0, loop_cls=ABELoop, abe_config=ABEConfig.construct_from_args(cell_args))
+    else:
+        loop = build_loop(cell_args, reward=DummyReward(), mean_weight=0)
     summary = loop.explore_loop(loop.config.num_iters, loop.config.samples_per_iter)
     runtime = time.perf_counter() - t0
 
@@ -70,10 +74,11 @@ def run_cell(args: argparse.Namespace, w: float, l: float, seed: int):
     metrics = loop.problem.compute_metrics(sample, {})
 
     result = {
+        "method": args.method,
         "width": w,
         "length": l,
         "seed": seed,
-        "budget": loop.config.num_iters * loop.config.samples_per_iter,
+        "budget": loop.config.num_iters * (args.abe_query_budget if args.method == "abe" else loop.config.samples_per_iter),
         "runtime": runtime,
         **summary,
         **{f"final_{k}": v for k, v in metrics.items()},
@@ -150,7 +155,7 @@ def plot(args: argparse.Namespace):
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.4), constrained_layout=True)
     plot_geometry(axes[0], widths, lengths, args)
-    plot_contour(fig, axes[1], widths, lengths, median, solved_frac, fit)
+    plot_contour(fig, axes[1], widths, lengths, median, solved_frac, fit, results[0].get("method", "actflow"))
     plot_fit(axes[2], solved, fit)
 
     fig.savefig(args.dir / "corridor_cost.png", dpi=200)
@@ -181,7 +186,7 @@ def plot_geometry(ax, widths: np.ndarray, lengths: np.ndarray, args: argparse.Na
     ax.set_title(r"Valid region $\Omega_\star = S_0 \cup C \cup A$", fontsize=10)
 
 
-def plot_contour(fig, ax, widths, lengths, median, solved_frac, fit):
+def plot_contour(fig, ax, widths, lengths, median, solved_frac, fit, method: str = "actflow"):
     L, W = np.meshgrid(lengths, widths)
     logT = np.ma.masked_invalid(np.log10(median))
 
@@ -213,7 +218,7 @@ def plot_contour(fig, ax, widths, lengths, median, solved_frac, fit):
     ax.yaxis.set_minor_formatter(ticker.NullFormatter())
     ax.set_xlabel(r"corridor length $\ell$")
     ax.set_ylabel(r"corridor width $w$")
-    ax.set_title("ActFlow cost to cross the corridor", fontsize=10)
+    ax.set_title(f"{'ABE' if method == 'abe' else 'ActFlow'} cost to cross the corridor", fontsize=10)
     ax.legend(fontsize=7, loc="lower right")
 
 
@@ -260,6 +265,9 @@ def build_parser() -> argparse.ArgumentParser:
 
         sub.add_argument("--no_uncertainty", action="store_true")
         sub.add_argument("--no_verifier", action="store_true")
+
+        sub.add_argument("--method", type=str, choices=["actflow", "abe"], default="actflow")
+        add_abe_args(sub)
 
         sub.add_argument("--widths", type=float, nargs="+", default=[0.1, 0.15, 0.2, 0.3, 0.45, 0.6])
         sub.add_argument("--lengths", type=float, nargs="+", default=[0.5, 1.0, 1.5, 2.0, 2.5, 3.0])

@@ -181,6 +181,7 @@ class UncertaintyEstimator(Reward[D]):
         latents: list[D],
         labels: list[torch.Tensor],
         kwargs: list[dict[str, Any]],
+        standardize: bool = True,
     ):
         """Update data which is used to update the uncertainty estimator.
 
@@ -193,6 +194,9 @@ class UncertaintyEstimator(Reward[D]):
             or reward values in the task-directed case.
         kwargs : list[dict[str, Any]]
             Keyword arguments used to obtain the latents.
+        standardize : bool, default: True
+            Whether to standardize the labels to zero mean and unit variance. With imbalanced binary
+            labels, this makes the minority class weigh much more than the majority class.
         """
         with torch.no_grad():
             feats = [self._get_feats(x, **kw) for x, kw in zip(latents, kwargs)]
@@ -200,7 +204,9 @@ class UncertaintyEstimator(Reward[D]):
         feats_tensor = torch.cat(feats, dim=0)
         labels_tensor = torch.cat(labels, dim=0)
 
-        labels_tensor = (labels_tensor - labels_tensor.mean()) / (labels_tensor.std() + 1e-8)
+        if standardize:
+            labels_tensor = (labels_tensor - labels_tensor.mean()) / (labels_tensor.std() + 1e-8)
+
         labels_tensor = labels_tensor.to(self.device)
 
         self._update_estimator(feats_tensor, labels_tensor)

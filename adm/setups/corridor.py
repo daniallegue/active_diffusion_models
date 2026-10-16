@@ -29,6 +29,10 @@ class CorridorProblemSetup(ProblemSetup[DDTensor]):
     from S_0 to A is l, so the width and length of the corridor are controlled directly. The
     position of S_0 does not depend on (w, l), so the same pre-trained base model can be shared
     across a sweep via `--corridor_base_ckpt`.
+
+    With w = 0 there is no corridor, and S_0 and A are disconnected islands separated by a gap of l.
+    `frac_between` in the metrics is the fraction of samples between the islands (in the corridor
+    or the gap), which is a measure of spurious mass bridging the islands when w = 0.
     """
 
     def __init__(self, args: dict[str, Any], device: Optional[torch.device]=None):
@@ -42,8 +46,8 @@ class CorridorProblemSetup(ProblemSetup[DDTensor]):
         self.x0 = args.get("corridor_x0", -1.5)
         self.solve_count = args.get("corridor_solve_count", 1)
 
-        if self.width <= 0 or self.length <= 0:
-            raise ValueError(f"corridor width and length must be positive, got w={self.width}, l={self.length}")
+        if self.width < 0 or self.length <= 0:
+            raise ValueError(f"corridor width must be non-negative and length positive, got w={self.width}, l={self.length}")
 
         if self.width > self.island_size:
             raise ValueError(f"corridor width ({self.width}) cannot exceed island size ({self.island_size})")
@@ -98,7 +102,9 @@ class CorridorProblemSetup(ProblemSetup[DDTensor]):
 
     def validity(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor:
         xy = samples.data
-        inside = self._in_box(xy, self.source_box) | self._in_box(xy, self.corridor_box) | self._in_box(xy, self.target_box)
+        inside = self._in_box(xy, self.source_box) | self._in_box(xy, self.target_box)
+        if self.width > 0:
+            inside = inside | self._in_box(xy, self.corridor_box)
         return inside.bool()
 
     def is_solved(self, batch: Batch[DDTensor]) -> bool:
@@ -119,6 +125,7 @@ class CorridorProblemSetup(ProblemSetup[DDTensor]):
             "frac_in_target": (valid & self.in_target(samples)).float().mean().item(),
             "max_progress": prog.max().item() if len(prog) > 0 else 0.0,
             "q99_progress": prog.quantile(0.99).item() if len(prog) > 0 else 0.0,
+            "frac_between": self._in_box(samples.data, (self.x0, self.x0 + self.length, -self.island_size / 2, self.island_size / 2)).float().mean().item(),
         }
 
     @property

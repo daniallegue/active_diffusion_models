@@ -62,6 +62,7 @@ class ExploreConfig:
     no_verifier: bool = False
     stop_when_solved: bool = False
     no_visualize: bool = False
+    save_batches: bool = False
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -202,6 +203,16 @@ class ExploreLoop(Generic[D]):
             [b.kwargs for b in batches],
         )
 
+    def save_checkpoint(self, iteration: int):
+        ckpt_dir = self.config.folder / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        state_dict = self.base_model.state_dict()
+        torch.save(state_dict, ckpt_dir / "last.pt")
+
+        if self.config.ckpt_every > 0 and iteration % self.config.ckpt_every == 0:
+            torch.save(state_dict, ckpt_dir / f"ckpt_{iteration}.pt")
+
     def visualize_iter(self, batch: Batch[D], iteration: int):
         # Visualizing an iteration is problem-dependent
         fig = self.problem.visualize_sample(self.env, self.uncertainty, batch)
@@ -277,6 +288,10 @@ class ExploreLoop(Generic[D]):
 
             # Store data
             batches.append(batch)
+            if self.config.save_batches:
+                batch_dir = self.config.folder / "batches"
+                batch_dir.mkdir(parents=True, exist_ok=True)
+                torch.save({"latents": batch.latents, "valids": batch.valids}, batch_dir / f"{i:04d}.pt")
 
             # Logging and visualization
             with self._timer("visualize"):
@@ -305,14 +320,7 @@ class ExploreLoop(Generic[D]):
 
             # Save checkpoint
             with self._timer("checkpoint"):
-                ckpt_dir = self.config.folder / "checkpoints"
-                ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-                state_dict = self.base_model.state_dict()
-                torch.save(state_dict, ckpt_dir / "last.pt")
-
-                if self.config.ckpt_every > 0 and i % self.config.ckpt_every == 0:
-                    torch.save(state_dict, ckpt_dir / f"ckpt_{i}.pt")
+                self.save_checkpoint(i)
 
             # Write timings to CSV
             self._flush_timings(i)
@@ -342,8 +350,15 @@ def setup_and_run(args: argparse.Namespace, reward: Reward, mean_weight: float):
     loop.explore_loop(loop.config.num_iters, loop.config.samples_per_iter)
 
 
-def build_loop(args: argparse.Namespace, reward: Reward, mean_weight: float) -> ExploreLoop:
-    """Shared initialization logic for task-agnostic and task-directed."""
+def build_loop(
+    args: argparse.Namespace,
+    reward: Reward,
+    mean_weight: float,
+    loop_cls: type[ExploreLoop] = ExploreLoop,
+    **loop_kwargs: Any,
+) -> ExploreLoop:
+    """Shared initialization logic for task-agnostic and task-directed. `loop_cls` and `loop_kwargs`
+    allow swapping in a different exploration loop, e.g., `ABELoop`."""
     if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
@@ -388,7 +403,7 @@ def build_loop(args: argparse.Namespace, reward: Reward, mean_weight: float) -> 
     logger = setup_logger(config.folder, args.verbose)
     logger.info("starting...")
 
-    return ExploreLoop(problem_setup=problem_setup, uncertainty=uncertainty, reward=reward, config=config, logger=logger)
+    return loop_cls(problem_setup=problem_setup, uncertainty=uncertainty, reward=reward, config=config, logger=logger, **loop_kwargs)
 
 
 def build_parser(add_extra_args):
@@ -455,3 +470,4 @@ def add_global_args(parser):
     parser.add_argument("--video_fps", type=int, default=4)
     parser.add_argument("--no_visualize", action="store_true")
     parser.add_argument("--stop_when_solved", action="store_true")
+    parser.add_argument("--save_batches", action="store_true", help="Save every exploration batch's latents and validity")
