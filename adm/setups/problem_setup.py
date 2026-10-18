@@ -1,8 +1,8 @@
-from typing import Generic, Any
+from typing import Generic, Any, Callable, Optional
 from abc import ABC, abstractmethod
 
 import torch
-from diffusiongym import D, BaseModel, Environment
+from diffusiongym import D, BaseModel, Environment, DDTensor
 from matplotlib.figure import Figure
 from pathlib import Path
 from argparse import ArgumentParser
@@ -77,6 +77,84 @@ class ProblemSetup(ABC, Generic[D]):
             Whether the problem is solved.
         """
         return False
+
+    def disperse(
+        self,
+        env: Environment[D],
+        latents: D,
+        scale: float,
+        noise: Callable[[int, int], torch.Tensor],
+    ) -> D:
+        """Perturb latents locally, used by ABE to disperse its pool under the reference process.
+
+        Parameters
+        ----------
+        env : Environment[D]
+            The environment of the current model, e.g., to regenerate partially noised latents.
+        latents : D
+            The latents to perturb.
+        scale : float
+            The scale of the perturbation.
+        noise : Callable[[int, int], torch.Tensor]
+            Samples n displacements of dimension d with the given scale under ABE's reference law.
+
+        Returns
+        -------
+        D
+            The perturbed latents.
+
+        Notes
+        -----
+        The default adds `noise` to tensor latents. Other latents, e.g., molecular graphs, have no
+        meaningful sum with a displacement and must override this method, for example by noising the
+        latents to a time that depends on `scale` and regenerating them with the model.
+        """
+        if not isinstance(latents, DDTensor):
+            raise NotImplementedError(f"{type(self).__name__} must implement `disperse` for {type(latents).__name__} latents")
+
+        disp = noise(len(latents), latents.data[0].numel()).to(latents.data.device)
+        return DDTensor(latents.data + disp.reshape(latents.data.shape))  # type: ignore
+
+    def distance_features(self, latents: D) -> Optional[torch.Tensor]:
+        """Features in which ABE measures distances between latents, for diverse selection and
+        for its trust region.
+
+        Parameters
+        ----------
+        latents : D
+            The latents.
+
+        Returns
+        -------
+        torch.Tensor | None
+            A tensor of shape (n, d), or None to use the features of the uncertainty estimator.
+
+        Notes
+        -----
+        The default flattens tensor latents and returns None otherwise. Features should not depend on
+        arbitrary choices in the representation, such as the order or orientation of atoms.
+        """
+        if isinstance(latents, DDTensor):
+            return latents.data.flatten(1)
+
+        return None
+
+    def distance(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Pairwise distances between two sets of distance features.
+
+        Parameters
+        ----------
+        a : torch.Tensor, shape (n, d)
+            The first set of features.
+        b : torch.Tensor, shape (m, d)
+            The second set of features.
+
+        Returns
+        -------
+        torch.Tensor, shape (n, m)
+            The pairwise distances. The default is Euclidean.
+        """
+        return torch.cdist(a, b)
 
     def postprocess_latents(self, batch: Batch[D]) -> D:
         """Post-process latents generated from the base model.

@@ -1,15 +1,16 @@
 """Active Bridge Expansion (ABE): the Schrödinger bridge variant of ActFlow.
 """
 
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 from dataclasses import dataclass
 import argparse
+import copy
 import math
 
 import torch
 import torch.nn.functional as F
-from diffusiongym import DDTensor, DummyReward
-from diffusiongym.utils import train_base_model
+from diffusiongym import D, DDTensor, DummyReward, BaseModel, Environment, Sample, construct_env
+from diffusiongym.utils import train_base_model, dict_to_device
 from diffusiongym.base_models.one_dim_gmm import MLP
 
 from .explore import ExploreLoop, build_loop, build_parser
@@ -42,7 +43,7 @@ class ABEConfig:
     # Target and bridge
     pool_size: int = 1024            # N
     smooth_bandwidth: float = 0.02   # bandwidth h of Smooth
-    bridge: Literal["cfm", "sb"] = "cfm"
+    bridge: Literal["cfm", "sb", "none"] = "cfm"
     bridge_steps: int = 500
     bridge_batch_size: int = 256
     bridge_lr: float = 1e-3
@@ -61,7 +62,7 @@ class ABEConfig:
     trust_direction: Literal["reverse", "forward"] = "reverse"  # KL(mu_theta || mu_theta') or KL(mu_theta' || mu_theta)
     distill_size: int = 1024
     distill_check_every: int = 50
-    kl_neighbours: int = 5
+    trust_samples: int = 256         # paths for the Girsanov estimate of the trust region
 
     # Diagnostics
     save_rounds: bool = False        # save pool, proposals, selection, and model samples per round
@@ -93,23 +94,29 @@ class ABEConfig:
         return ABEConfig(**clean_kwargs)
 
 
-class ABELoop(ExploreLoop[DDTensor]):
+class ABELoop(ExploreLoop[D]):
+    """ABE on any latent type D. Particles are always kept as latents of type D, and the problem setup
+    provides the operations that depend on the representation: `disperse` (line 4), and
+    `distance_features` and `distance` (diverse selection and the trust region). The cfm and sb
+    bridges need fixed-size tensors; `bridge="none"` proposes from mu* directly and works for any D."""
+
     def __init__(self, *args: Any, abe_config: ABEConfig, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.abe = abe_config
 
         x, sample_kwargs = self.base_model.sample_p0(1)
-        if not isinstance(x, DDTensor):
-            raise TypeError(f"ABE requires DDTensor latents, got {type(x).__name__}")
-
         if len(sample_kwargs) > 0:
             raise ValueError("ABE only supports unconditional problem setups")
 
+        if self.abe.bridge != "none" and not isinstance(x, DDTensor):
+            raise TypeError(f"The {self.abe.bridge} bridge requires DDTensor latents, got {type(x).__name__}; use bridge='none'")
+
         self._surrogate_fitted = False
-        self.latent_shape = x.data.shape[1:]
-        dim = x.data[0].numel()
-        self.bridge = MLP(dim, dim).to(self.base_model.device)
-        self.bridge_opt = torch.optim.Adam(self.bridge.parameters(), lr=self.abe.bridge_lr)
+        if self.abe.bridge != "none":
+            self.latent_shape = x.data.shape[1:]
+            dim = x.data[0].numel()
+            self.bridge = MLP(dim, dim).to(self.base_model.device)
+            self.bridge_opt = torch.optim.Adam(self.bridge.parameters(), lr=self.abe.bridge_lr)
 
         # ABE has different phases than ActFlow, so we rewrite the timings header
         self.timing_heads = [
@@ -123,21 +130,46 @@ class ABELoop(ExploreLoop[DDTensor]):
     def device(self) -> torch.device:
         return self.base_model.device
 
-    def _to_latent(self, x: torch.Tensor) -> DDTensor:
+    def _flat(self, x: DDTensor) -> torch.Tensor:
+        return x.data.flatten(1)
+
+    def _unflat(self, x: torch.Tensor) -> DDTensor:
         return DDTensor(x.reshape(-1, *self.latent_shape))
 
     @torch.no_grad()
-    def sample_model(self, n: int) -> torch.Tensor:
-        """Draws n samples from the current flow model mu_theta as flat latents."""
+    def sample_model(self, n: int) -> D:
+        """Draws n samples from the current flow model mu_theta as latents."""
         if n == 0:
-            return torch.empty(0, math.prod(self.latent_shape), device=self.device)
+            return take(self.sample_model(1), torch.arange(0))
 
         sample = self.env.batch_sample(n, self.config.sample_batch_size)
-        latents = self.problem.postprocess_latents(Batch.from_sample(sample))
-        return latents.data.flatten(1).to(self.device)
+        return self.problem.postprocess_latents(Batch.from_sample(sample)).to(self.device)
+
+    def disperse(self, x: D, scale: float, reference: Optional[str] = None) -> D:
+        """Disperses latents under the reference Q with the given scale (line 4). The problem setup
+        decides how a displacement acts on its latents."""
+        if len(x) == 0 or scale <= 0:
+            return x
+
+        def noise(n: int, d: int) -> torch.Tensor:
+            return sample_reference(n, d, scale, self.abe, self.device, reference)
+
+        return self.problem.disperse(self.env, x, scale, noise)
 
     @torch.no_grad()
-    def acquisition(self, x: torch.Tensor, has_data: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    def features(self, x: D) -> torch.Tensor:
+        """Distance features of latents: the problem setup's, or else the uncertainty estimator's."""
+        feats = self.problem.distance_features(x)
+        if feats is None:
+            feats = self.uncertainty._get_feats(x)
+
+        return feats.to(self.device)
+
+    def distance(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return self.problem.distance(a, b)
+
+    @torch.no_grad()
+    def acquisition(self, x: D, has_data: bool) -> tuple[torch.Tensor, torch.Tensor]:
         """Acquisition score and feasibility mask of the surrogate. For "uncertainty", the score is
         sigma(x), and x is feasible unless it is confidently invalid, i.e., mu(x) + lambda sigma(x) < 0.
         For "ucb", the score is mu(x) + kappa sigma(x) and everything is feasible. Before any data or
@@ -146,7 +178,7 @@ class ABELoop(ExploreLoop[DDTensor]):
         if not has_data or self.config.no_uncertainty:
             return torch.zeros(len(x), device=self.device), feasible
 
-        mean, uncert = self.uncertainty.mean_and_uncertainty(self._to_latent(x))
+        mean, uncert = self.uncertainty.mean_and_uncertainty(x)
         mean, uncert = mean.to(self.device), uncert.to(self.device)
         if self.abe.acquisition == "ucb":
             return mean + self.abe.kappa * uncert, feasible
@@ -154,16 +186,16 @@ class ABELoop(ExploreLoop[DDTensor]):
         return uncert, mean + self.abe.feasibility_weight * uncert >= 0
 
     @torch.no_grad()
-    def confidently_valid(self, x: torch.Tensor) -> torch.Tensor:
+    def confidently_valid(self, x: D) -> torch.Tensor:
         """Lower-confidence-bound rule mu(x) - lambda_s sigma(x) >= 0 of the surrogate. Without a
         fitted surrogate, nothing is confidently valid."""
         if len(x) == 0 or not self._surrogate_fitted:
             return torch.zeros(len(x), dtype=torch.bool, device=self.device)
 
-        mean, uncert = self.uncertainty.mean_and_uncertainty(self._to_latent(x))
+        mean, uncert = self.uncertainty.mean_and_uncertainty(x)
         return (mean - self.abe.safety_weight * uncert >= 0).to(self.device)
 
-    def update_uncertainty_estimator(self, batches: list[Batch[DDTensor]]):
+    def update_uncertainty_estimator(self, batches: list[Batch[D]]):
         """Fits the surrogate on validity labels. Unless `standardize_labels`, these are centred to
         +-0.5 without rescaling, such that the zero prior mean of a GP means "unknown" and a single
         invalid point does not outweigh many valid ones."""
@@ -178,8 +210,16 @@ class ABELoop(ExploreLoop[DDTensor]):
             standardize=False,
         )
 
-    def fit_bridge(self, source: torch.Tensor, target: torch.Tensor, target_weights: torch.Tensor) -> float:
+    def positives(self, batches: list[Batch[D]]) -> D:
+        """All verified positives D^+ so far."""
+        return cat([take(b.latents, b.valids.nonzero().squeeze(1)) for b in batches]).to(self.device)
+
+    def fit_bridge(self, source: D, target: D, target_weights: torch.Tensor) -> float:
         """Fits the bridge between `source` and the smoothed weighted `target` (line 8)."""
+        if self.abe.bridge == "none":
+            return 0.0
+
+        source, target = self._flat(source), self._flat(target)  # type: ignore
         eps = self.abe.step_size
         bs = self.abe.bridge_batch_size
         loss_sum = 0.0
@@ -218,30 +258,40 @@ class ABELoop(ExploreLoop[DDTensor]):
         return loss_sum / max(1, self.abe.bridge_steps)
 
     @torch.no_grad()
-    def simulate_bridge(self, x0: torch.Tensor) -> torch.Tensor:
+    def simulate_bridge(self, x0: DDTensor) -> DDTensor:
         """Simulates the fitted bridge from x0 at t = 0 to its endpoint at t = 1, as an ODE for `cfm`
         and as an SDE with the noise of Q for `sb`."""
         eps = self.abe.step_size if self.abe.bridge == "sb" else 0.0
         num_steps = self.config.num_steps
         dt = 1.0 / num_steps
 
-        x = x0.clone()
+        x = self._flat(x0).clone()
         for k in range(num_steps):
             t = torch.full((len(x),), k * dt, device=self.device)
             x = x + dt * self.bridge(x, t) + math.sqrt(eps * dt) * torch.randn_like(x)
 
-        return x
+        return self._unflat(x)
 
-    def distill(self, bridge_endpoints: torch.Tensor, positives: torch.Tensor) -> dict[str, Any]:
+    def propose(self, n: int, target: D, target_weights: torch.Tensor) -> D:
+        """Draws n samples of the bridge endpoint M_1 (line 9). Without a bridge, M_1 = mu*: the
+        target is resampled and smoothed with a Gaussian dispersal of bandwidth h."""
+        if self.abe.bridge != "none":
+            return self.simulate_bridge(self.sample_model(n))  # type: ignore
+
+        x = take(target, torch.multinomial(target_weights, n, replacement=True))
+        return self.disperse(x, self.abe.smooth_bandwidth, reference="gaussian")
+
+    def distill(self, bridge_endpoints: D, positives: D) -> dict[str, Any]:
         """Distills alpha M_1 + (1 - alpha) mu_theta into the flow model for `ft_steps`,
         with a trust region of radius rho: training stops early once a chunk moves the model further
-        than rho, and that chunk is rolled back. 
+        than rho, and that chunk is rolled back. The distance moved is the Girsanov KL between the
+        path measures of the old and new model (`path_kl`), by default KL(P_old || P_new), which only
+        penalizes losing mass that the old model had.
 
         With the "lcb" filter, only verified positives and confidently valid points are distilled:
         the bridge part is resampled from the confidently valid endpoints and the positives, and the
         model part from the confidently valid model samples (or the bridge part if there are none)."""
         n = self.abe.distill_size
-        reference = self.sample_model(n)
         anchor = self.sample_model(n - len(bridge_endpoints))
         info: dict[str, Any] = {}
 
@@ -251,22 +301,22 @@ class ABELoop(ExploreLoop[DDTensor]):
             info["safe_ends"] = safe_endpoints.float().mean().item() if len(bridge_endpoints) > 0 else 0.0
             info["safe_anchor"] = safe_anchor.float().mean().item() if len(anchor) > 0 else 0.0
 
-            bridge_pool = torch.cat([bridge_endpoints[safe_endpoints], positives], dim=0)
-            anchor_pool = anchor[safe_anchor] if safe_anchor.any() else bridge_pool
+            bridge_pool = cat([take(bridge_endpoints, safe_endpoints.nonzero().squeeze(1)), positives])
+            anchor_pool = take(anchor, safe_anchor.nonzero().squeeze(1)) if safe_anchor.any() else bridge_pool
             if len(bridge_pool) == 0:
                 bridge_pool = anchor_pool
 
             if len(bridge_pool) == 0:
                 return {
-                    **info, "distill_steps": 0, "distill_moved": 0.0, "distill_fit": 0.0,
-                    "samples": reference, "target": reference[:0], "target_bridge": 0,
+                    **info, "distill_steps": 0, "distill_moved": 0.0,
+                    "target": take(anchor, torch.arange(0)), "target_bridge": 0,
                 }
 
-            bridge_endpoints = bridge_pool[torch.randint(len(bridge_pool), (len(bridge_endpoints),), device=self.device)]
-            anchor = anchor_pool[torch.randint(len(anchor_pool), (len(anchor),), device=self.device)]
+            bridge_endpoints = take(bridge_pool, torch.randint(len(bridge_pool), (len(bridge_endpoints),), device=self.device))
+            anchor = take(anchor_pool, torch.randint(len(anchor_pool), (len(anchor),), device=self.device))
 
-        target = torch.cat([bridge_endpoints, anchor], dim=0)
-        target_latents = self._to_latent(target.cpu())
+        target = cat([bridge_endpoints, anchor])
+        target_latents = target.to("cpu")
 
         opt = torch.optim.AdamW(
             self.base_model.parameters(),
@@ -274,9 +324,12 @@ class ABELoop(ExploreLoop[DDTensor]):
             weight_decay=self.config.ft_weight_decay,
         )
 
+        # For the reverse direction, the old model's paths are sampled once and reused for every check
+        old_model = copy.deepcopy(self.base_model).eval()
+        old_paths = self.sample_paths(old_model, self.base_model) if self.abe.trust_direction == "reverse" else None
+
         steps = 0
         moved = 0.0
-        samples = reference
         while steps < self.config.ft_steps:
             prev_state = {k: v.clone() for k, v in self.base_model.state_dict().items()}
             chunk = min(self.abe.distill_check_every, self.config.ft_steps - steps)
@@ -290,32 +343,62 @@ class ABELoop(ExploreLoop[DDTensor]):
                 pbar=False,
             )
 
-            new_samples = self.sample_model(n)
             if self.abe.trust_direction == "reverse":
-                new_moved = knn_kl(reference, new_samples, self.abe.kl_neighbours)
+                new_moved = self.path_kl(old_model, self.base_model, old_paths)
             else:
-                new_moved = knn_kl(new_samples, reference, self.abe.kl_neighbours)
+                new_moved = self.path_kl(self.base_model, old_model)
             if new_moved > self.abe.trust_radius:
+                info["distill_rejected"] = new_moved
                 self.base_model.load_state_dict(prev_state)
                 break
 
             steps += chunk
             moved = new_moved
-            samples = new_samples
 
         return {
             **info,
             "distill_steps": steps,
             "distill_moved": moved,
-            "distill_fit": knn_kl(samples, target, self.abe.kl_neighbours),
-            "samples": samples,
             "target": target,
             "target_bridge": len(bridge_endpoints),
         }
 
-    def query(self, x: torch.Tensor) -> Batch[DDTensor]:
+    def _path_env(self, p: BaseModel[D], q: BaseModel[D]) -> Environment[D]:
+        """Environment that samples with p and measures its control relative to q."""
+        env = construct_env(q, DummyReward(), self.config.num_steps)
+        env.policy = p
+        return env
+
+    @torch.no_grad()
+    def sample_paths(self, p: BaseModel[D], q: BaseModel[D]) -> Sample[D]:
+        """Samples `trust_samples` trajectories of the SDE of model p."""
+        return self._path_env(p, q).batch_sample(self.abe.trust_samples, self.config.sample_batch_size)
+
+    @torch.no_grad()
+    def path_kl(self, p: BaseModel[D], q: BaseModel[D], paths: Optional[Sample[D]] = None) -> float:
+        """Girsanov estimate of KL(P_p || P_q) between the path measures of the SDEs of two models
+        with the same noise schedule, an upper bound on the KL between their samples:
+
+            KL(P_p || P_q) = E_{paths ~ p} int_0^1 1/2 ||u_p(x_t, t) - u_q(x_t, t)||^2 dt,
+
+        where u_p - u_q is the difference of their drifts scaled by the noise. Paths of p are sampled unless given, e.g., to reuse them across checks."""
+        if paths is None:
+            paths = self.sample_paths(p, q)
+
+        env = self._path_env(p, q)
+        kwargs = dict_to_device(paths.kwargs, self.device)
+        kl = torch.zeros(len(paths), device=self.device)
+        for i, (t0, t1) in enumerate(zip(paths.timesteps[:-1], paths.timesteps[1:])):
+            x = paths.trajectory[i].to(self.device)
+            t = t0 * torch.ones(len(paths), device=self.device)
+            _, running_cost = env.drift(x, t, **kwargs)
+            kl += (t1 - t0) * running_cost.to(self.device)
+
+        return kl.mean().item()
+
+    def query(self, x: D) -> Batch[D]:
         """Queries the verifier on the selected latents (line 11)."""
-        latents = self._to_latent(x.cpu())
+        latents = x.to("cpu")
         samples = self.base_model.postprocess(latents.to(self.device)).to("cpu")
         valids = self.problem.validity(samples, {}).cpu().bool()
         return Batch(samples=samples, latents=latents, rewards=torch.zeros(len(x)), valids=valids, kwargs={})
@@ -324,7 +407,7 @@ class ABELoop(ExploreLoop[DDTensor]):
         """Runs ABE. `samples_per_iter` is unused, since the verifier is only queried on
         `query_budget` samples per round."""
         cfg = self.abe
-        batches: list[Batch[DDTensor]] = []
+        batches: list[Batch[D]] = []
         total_samples = 0
         total_valid_samples = 0
         samples_to_solve = None
@@ -342,44 +425,45 @@ class ABELoop(ExploreLoop[DDTensor]):
             # pool towards high acquisition (lines 4-6)
             with self._timer("disperse"):
                 source = self.sample_model(cfg.pool_size)
-                positives = [b.latents.data.flatten(1)[b.valids] for b in batches]
-                positives = torch.cat(positives, dim=0).to(self.device) if has_data else source[:0]
+                positives = self.positives(batches) if has_data else take(source, torch.arange(0))
 
                 num_frontier = round(cfg.frontier_frac * cfg.pool_size) if len(positives) > 0 else 0
-                starts = source[:cfg.pool_size - num_frontier]
+                starts = take(source, torch.arange(cfg.pool_size - num_frontier))
                 if num_frontier > 0:
                     frontier_score, _ = self.acquisition(positives, has_data)
                     frontier_weights, _ = tilt_weights(frontier_score, cfg.tilt, cfg.ess_min)
-                    frontier = positives[torch.multinomial(frontier_weights, num_frontier, replacement=True)]
-                    starts = torch.cat([starts, frontier], dim=0)
+                    frontier = take(positives, torch.multinomial(frontier_weights, num_frontier, replacement=True))
+                    starts = cat([starts, frontier])
 
-                pool = starts + sample_reference(len(starts), starts.shape[1], cfg, self.device)
+                pool = self.disperse(starts, math.sqrt(cfg.step_size * cfg.disperse_time))
                 pool_score, pool_feasible = self.acquisition(pool, has_data)
                 weights, beta = tilt_weights(pool_score, cfg.tilt, cfg.ess_min, pool_feasible)
 
             # Build the target from the tilted pool and the positives, and fit the bridge (lines 7-8)
             with self._timer("bridge"):
-                target = torch.cat([pool, positives], dim=0)
+                target = cat([pool, positives])
                 target_weights = torch.cat([len(pool) * weights, torch.ones(len(positives), device=self.device)])
-                bridge_loss = self.fit_bridge(source, target, target_weights / target_weights.sum())
+                target_weights = target_weights / target_weights.sum()
+                bridge_loss = self.fit_bridge(source, target, target_weights)
 
             # Propose candidates from the bridge endpoint (line 9)
             with self._timer("propose"):
-                candidates = self.simulate_bridge(self.sample_model(cfg.proposal_size))
+                candidates = self.propose(cfg.proposal_size, target, target_weights)
 
             # Select a diverse batch with high acquisition (line 10)
             with self._timer("select"):
                 cand_score, cand_feasible = self.acquisition(candidates, has_data)
                 selected = greedy_diverse(
-                    candidates,
+                    self.features(candidates),
                     cand_score.masked_fill(~cand_feasible, float("-inf")),
                     cfg.query_budget,
                     cfg.exclusion_radius,
+                    self.distance,
                 )
 
             # Query verifier on the selected samples only (line 11)
             with self._timer("query"):
-                batch = self.query(candidates[selected])
+                batch = self.query(take(candidates, selected))
                 total_samples += len(batch)
                 total_valid_samples += batch.valids.int().sum().item()
                 solved = self.problem.is_solved(batch)
@@ -409,28 +493,28 @@ class ABELoop(ExploreLoop[DDTensor]):
             # Distill the bridge into the flow model (line 12)
             with self._timer("finetune"):
                 num_bridge = round(cfg.mix_weight * cfg.distill_size)
-                bridge_endpoints = self.simulate_bridge(self.sample_model(num_bridge))
-                new_positives = [b.latents.data.flatten(1)[b.valids] for b in batches]
-                distilled = self.distill(bridge_endpoints, torch.cat(new_positives, dim=0).to(self.device))
-                metrics.update({k: v for k, v in distilled.items() if k not in ("samples", "target", "target_bridge")})
+                bridge_endpoints = self.propose(num_bridge, target, target_weights)
+                distilled = self.distill(bridge_endpoints, self.positives(batches))
+                metrics.update({k: v for k, v in distilled.items() if k not in ("target", "target_bridge")})
 
             if cfg.save_rounds:
+                # Particles are saved as their distance features, i.e., coordinates for tensor latents
                 rounds_dir = self.config.folder / "rounds"
                 rounds_dir.mkdir(parents=True, exist_ok=True)
                 torch.save({
-                    "source": source.cpu(),
-                    "pool": pool.cpu(),
+                    "source": self.features(source).cpu(),
+                    "pool": self.features(pool).cpu(),
                     "weights": weights.cpu(),
                     "beta": beta,
-                    "target": target.cpu(),
-                    "target_weights": (target_weights / target_weights.sum()).cpu(),
-                    "candidates": candidates.cpu(),
+                    "target": self.features(target).cpu(),
+                    "target_weights": target_weights.cpu(),
+                    "candidates": self.features(candidates).cpu(),
                     "selected": selected.cpu(),
                     "valids": batch.valids,
-                    "bridge_endpoints": bridge_endpoints.cpu(),
-                    "distill_target": distilled["target"].cpu(),
+                    "bridge_endpoints": self.features(bridge_endpoints).cpu(),
+                    "distill_target": self.features(distilled["target"]).cpu(),
                     "distill_target_bridge": distilled["target_bridge"],
-                    "model_samples": distilled["samples"].cpu(),
+                    "model_samples": self.features(self.sample_model(cfg.distill_size)).cpu(),
                 }, rounds_dir / f"{i:04d}.pt")
 
             metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
@@ -460,6 +544,26 @@ class ABELoop(ExploreLoop[DDTensor]):
         }
 
 
+def take(x: D, idx: torch.Tensor) -> D:
+    """Selects latents by index, for any latent type."""
+    if isinstance(x, DDTensor):
+        return DDTensor(x.data[idx.to(x.data.device)])  # type: ignore
+
+    if len(idx) == 0:
+        return x[0:0]  # type: ignore
+
+    return type(x).collate([x[int(i)] for i in idx.tolist()])
+
+
+def cat(xs: list[D]) -> D:
+    """Concatenates latents, for any latent type. Empty sets are dropped unless all are empty."""
+    non_empty = [x for x in xs if len(x) > 0]
+    if len(non_empty) == 0:
+        return xs[0]
+
+    return type(non_empty[0]).collate(non_empty)
+
+
 def log_sinkhorn(cost: torch.Tensor, reg: float, num_iters: int) -> torch.Tensor:
     """Log of the entropic OT plan between uniform marginals, computed in the log domain."""
     n, m = cost.shape
@@ -473,9 +577,16 @@ def log_sinkhorn(cost: torch.Tensor, reg: float, num_iters: int) -> torch.Tensor
     return (f[:, None] + g[None, :] - cost) / reg
 
 
-def sample_reference(n: int, d: int, cfg: ABEConfig, device: torch.device) -> torch.Tensor:
-    """Displacements of the dispersal under the reference Q over time tau. All references
-    share the scale s = sqrt(eps tau) and only differ in their tails:
+def sample_reference(
+    n: int,
+    d: int,
+    s: float,
+    cfg: ABEConfig,
+    device: torch.device,
+    reference: Optional[str] = None,
+) -> torch.Tensor:
+    """n displacements in d dimensions under the reference Q (`cfg.reference` unless `reference`
+    is given) with scale s. The references only differ in their tails:
 
         gaussian: Brownian motion, s G.
         student:  multivariate Student-t with `reference_df` degrees of freedom, s G / sqrt(chi2 / df).
@@ -484,21 +595,21 @@ def sample_reference(n: int, d: int, cfg: ABEConfig, device: torch.device) -> to
         poisson:  Brownian motion plus N ~ Poisson(jump_rate tau) Gaussian jumps of std `jump_scale`.
 
     Displacements longer than `max_jump` are shortened to it."""
-    s = math.sqrt(cfg.step_size * cfg.disperse_time)
+    reference = reference or cfg.reference
     g = torch.randn(n, d, device=device)
 
-    if cfg.reference == "gaussian":
+    if reference == "gaussian":
         disp = s * g
-    elif cfg.reference == "student":
+    elif reference == "student":
         chi2 = torch.distributions.Chi2(torch.tensor(float(cfg.reference_df))).sample((n, 1)).to(device)
         disp = s * g / torch.sqrt(chi2 / cfg.reference_df)
-    elif cfg.reference == "levy":
+    elif reference == "levy":
         disp = s * torch.sqrt(positive_stable(cfg.reference_alpha / 2, n, device)).unsqueeze(1) * g
-    elif cfg.reference == "poisson":
+    elif reference == "poisson":
         num_jumps = torch.poisson(torch.full((n, 1), cfg.jump_rate * cfg.disperse_time, device=device))
         disp = s * g + cfg.jump_scale * torch.sqrt(num_jumps) * torch.randn(n, d, device=device)
     else:
-        raise ValueError(f"unknown reference {cfg.reference}")
+        raise ValueError(f"unknown reference {reference}")
 
     norm = disp.norm(dim=1, keepdim=True)
     return disp * (cfg.max_jump / norm).clamp(max=1.0)
@@ -550,32 +661,27 @@ def tilt_weights(
     return weights_at(lo), lo
 
 
-def greedy_diverse(x: torch.Tensor, score: torch.Tensor, budget: int, radius: float) -> torch.Tensor:
+def greedy_diverse(
+    x: torch.Tensor,
+    score: torch.Tensor,
+    budget: int,
+    radius: float,
+    distance: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = torch.cdist,
+) -> torch.Tensor:
     """Greedily picks up to `budget` points by descending score, skipping any point within `radius`
-    of an already picked one. Points with a score of -inf are never picked. Can return fewer than
+    of an already picked one under `distance` between the features x. Points with a score of -inf are never picked. Can return fewer than
     `budget` points if the candidates are clustered or infeasible."""
     picked: list[int] = []
     for j in torch.argsort(score, descending=True).tolist():
         if len(picked) == budget or score[j] == float("-inf"):
             break
 
-        if picked and torch.cdist(x[j:j+1], x[picked]).min() < radius:
+        if picked and distance(x[j:j+1], x[picked]).min() < radius:
             continue
 
         picked.append(j)
 
     return torch.tensor(picked, dtype=torch.long, device=x.device)
-
-
-def knn_kl(p: torch.Tensor, q: torch.Tensor, k: int = 5) -> float:
-    """k-NN estimate of KL(p || q) from samples (Wang, Kulkarni & Verdú, 2009)."""
-    n, d = p.shape
-    m = q.shape[0]
-
-    rho = torch.cdist(p, p).fill_diagonal_(float("inf")).kthvalue(k, dim=1).values
-    nu = torch.cdist(p, q).kthvalue(k, dim=1).values
-    log_ratio = nu.clamp_min(1e-12).log() - rho.clamp_min(1e-12).log()
-    return (d * log_ratio.mean() + math.log(m / (n - 1))).item()
 
 
 def main(args):
@@ -615,7 +721,7 @@ def add_abe_args(parser):
     parser.add_argument("--abe_ess_min", type=float, default=defaults.ess_min, help="As a fraction of the pool size")
     parser.add_argument("--abe_pool_size", type=int, default=defaults.pool_size, help="N")
     parser.add_argument("--abe_smooth_bandwidth", type=float, default=defaults.smooth_bandwidth)
-    parser.add_argument("--abe_bridge", type=str, choices=["cfm", "sb"], default=defaults.bridge)
+    parser.add_argument("--abe_bridge", type=str, choices=["cfm", "sb", "none"], default=defaults.bridge)
     parser.add_argument("--abe_bridge_steps", type=int, default=defaults.bridge_steps)
     parser.add_argument("--abe_bridge_batch_size", type=int, default=defaults.bridge_batch_size)
     parser.add_argument("--abe_bridge_lr", type=float, default=defaults.bridge_lr)
@@ -630,7 +736,7 @@ def add_abe_args(parser):
     parser.add_argument("--abe_trust_direction", type=str, choices=["reverse", "forward"], default=defaults.trust_direction)
     parser.add_argument("--abe_distill_size", type=int, default=defaults.distill_size)
     parser.add_argument("--abe_distill_check_every", type=int, default=defaults.distill_check_every)
-    parser.add_argument("--abe_kl_neighbours", type=int, default=defaults.kl_neighbours)
+    parser.add_argument("--abe_trust_samples", type=int, default=defaults.trust_samples)
     parser.add_argument("--abe_save_rounds", action="store_true")
 
 
