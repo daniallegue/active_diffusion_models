@@ -2,7 +2,7 @@
 """
 
 from typing import Any, Callable, Literal, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import argparse
 import copy
 import math
@@ -98,7 +98,8 @@ class ABELoop(ExploreLoop[D]):
     """ABE on any latent type D. Particles are always kept as latents of type D, and the problem setup
     provides the operations that depend on the representation: `disperse` (line 4), and
     `distance_features` and `distance` (diverse selection and the trust region). The cfm and sb
-    bridges need fixed-size tensors; `bridge="none"` proposes from mu* directly and works for any D."""
+    bridges need fixed-size tensors; `bridge="none"` proposes from mu* directly and works for any D,
+    and is used automatically for other latents, e.g., molecular graphs."""
 
     def __init__(self, *args: Any, abe_config: ABEConfig, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -109,7 +110,8 @@ class ABELoop(ExploreLoop[D]):
             raise ValueError("ABE only supports unconditional problem setups")
 
         if self.abe.bridge != "none" and not isinstance(x, DDTensor):
-            raise TypeError(f"The {self.abe.bridge} bridge requires DDTensor latents, got {type(x).__name__}; use bridge='none'")
+            self.logger.warning(f"the {self.abe.bridge} bridge requires DDTensor latents, got {type(x).__name__}; using bridge='none'")
+            self.abe = replace(self.abe, bridge="none")
 
         self._surrogate_fitted = False
         if self.abe.bridge != "none":
@@ -159,6 +161,9 @@ class ABELoop(ExploreLoop[D]):
     @torch.no_grad()
     def features(self, x: D) -> torch.Tensor:
         """Distance features of latents: the problem setup's, or else the uncertainty estimator's."""
+        if len(x) == 0:
+            return torch.zeros(0, 0, device=self.device)
+
         feats = self.problem.distance_features(x)
         if feats is None:
             feats = self.uncertainty._get_feats(x)
@@ -453,6 +458,9 @@ class ABELoop(ExploreLoop[D]):
             # Select a diverse batch with high acquisition (line 10)
             with self._timer("select"):
                 cand_score, cand_feasible = self.acquisition(candidates, has_data)
+                if not cand_feasible.any():
+                    cand_feasible = torch.ones_like(cand_feasible)
+
                 selected = greedy_diverse(
                     self.features(candidates),
                     cand_score.masked_fill(~cand_feasible, float("-inf")),
@@ -544,13 +552,24 @@ class ABELoop(ExploreLoop[D]):
         }
 
 
+class Empty:
+    """Empty set of latents, for latent types that cannot be empty, e.g., batched graphs. `cat` drops
+    it, and everything else checks the length before touching latents."""
+
+    def __len__(self) -> int:
+        return 0
+
+    def to(self, device: Any) -> "Empty":
+        return self
+
+
 def take(x: D, idx: torch.Tensor) -> D:
     """Selects latents by index, for any latent type."""
     if isinstance(x, DDTensor):
         return DDTensor(x.data[idx.to(x.data.device)])  # type: ignore
 
     if len(idx) == 0:
-        return x[0:0]  # type: ignore
+        return Empty()  # type: ignore
 
     return type(x).collate([x[int(i)] for i in idx.tolist()])
 

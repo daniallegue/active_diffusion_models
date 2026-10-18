@@ -1,10 +1,13 @@
-from typing import Optional, Any
+from typing import Optional, Any, Callable
+from itertools import pairwise
+import math
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import dgl
 from rdkit import Chem, RDLogger
-from rdkit.Chem import Draw, AllChem, Crippen, QED
+from rdkit.Chem import Draw, AllChem, Crippen, QED, rdFingerprintGenerator
 from flowmol.data_processing.utils import build_edge_idxs
 from flowmol.analysis.molecule_builder import SampledMolecule, bond_type_to_idx
 from diffusiongym import  BaseModel, Environment
@@ -26,11 +29,16 @@ from adm.uncertainty import UncertaintyEstimator
 from adm.utils import Batch
 
 
+FINGERPRINT_SIZE = 2048
+MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=FINGERPRINT_SIZE)
+
+
 class MoleculeProblemSetup(ProblemSetup[DDGraph]):
     def __init__(self, dataset: str, args: dict, device: Optional[torch.device] = None):
         RDLogger.DisableLog("rdApp.*")  # type: ignore
 
         self.geometry_opt: str = args["mol_geometry_opt"]
+        self.disperse_batch_size: int = args.get("mol_disperse_batch_size", 256)
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -48,6 +56,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
     @classmethod
     def add_args(cls, parser: ArgumentParser):
         parser.add_argument("--mol_geometry_opt", type=str, choices=["none", "mmff", "uff", "gfn2"], default="mmff")
+        parser.add_argument("--mol_disperse_batch_size", type=int, default=256, help="Molecules regenerated at once by ABE's dispersal")
 
     @property
     def base_model(self) -> BaseModel[DDGraph]:
@@ -109,6 +118,88 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
 
     def postprocess_latents(self, batch: Batch[DDGraph]) -> DDGraph:
         return self._postprocess_graph(batch.latents)
+
+    @torch.no_grad()
+    def disperse(
+        self,
+        env: Environment[DDGraph],
+        latents: DDGraph,
+        scale: float,
+        noise: Callable[[int, int], torch.Tensor],
+    ) -> DDGraph:
+        """Disperses molecules by noising them partially and regenerating them with the model, since
+        a displacement has no meaning on a graph. Each molecule draws its own noise-to-signal ratio
+        |noise| from ABE's reference law with the given scale, such that heavy-tailed references
+        occasionally regenerate a molecule from deep noise. The number of atoms is kept."""
+        ratio = noise(len(latents), 1).abs().squeeze(1).to(latents.device)
+        t = self._noise_time(ratio)
+
+        bs = self.disperse_batch_size
+        regenerated = [self._regenerate(env, latents[i:i + bs], t[i:i + bs]) for i in range(0, len(latents), bs)]
+        return self._postprocess_graph(DDGraph.collate(regenerated))
+
+    def _noise_time(self, ratio: torch.Tensor) -> torch.Tensor:
+        """Time t at which the positions have noise-to-signal ratio beta_t / alpha_t = `ratio`, under
+        the cosine schedule alpha_t = sin^2(pi / 2 t^nu) of the positions."""
+        nu = self.base_model.scheduler.schedulers["x_t"].nu
+        alpha = 1 / (1 + ratio)
+        t = (2 / math.pi * torch.asin(alpha.sqrt())) ** (1 / nu)
+
+        # Sampling starts at 2e-2 to avoid the singularity at 0
+        return t.clamp(2e-2, 1 - 1e-3)
+
+    def _regenerate(self, env: Environment[DDGraph], x1: DDGraph, t: torch.Tensor) -> DDGraph:
+        """Noises each molecule of x1 to its own time t and integrates the dynamics of `env` back to
+        t = 1. All molecules share the time grid of `env`, and each one only moves once the grid has
+        passed its t."""
+        scheduler = self.base_model.scheduler
+        x = scheduler.alpha(x1, t) * x1 + scheduler.beta(x1, t) * x1.randn_like()
+
+        grid = torch.linspace(t.min().item(), 1.0, env.discretization_steps + 1).tolist()
+        for t0, t1 in pairwise(grid):
+            t_curr = t.clamp(min=t0)
+            dt = (t1 - t_curr).clamp(min=0)
+            if not (dt > 0).any():
+                continue
+
+            drift, _ = env.drift(x, t_curr)
+            diffusion = env.diffusion(x, t_curr)
+            x = x + per_graph(x, dt) * drift + per_graph(x, dt.sqrt()) * diffusion * x.randn_like()
+
+        # Write the regenerated features back into the original graph, such that its other data, e.g.,
+        # the upper edge mask, is kept and it can be batched with other latents
+        graph = x1.graph.clone()
+        for key, val in x.graph.ndata.items():
+            graph.ndata[key] = val
+        for key, val in x.graph.edata.items():
+            graph.edata[key] = val
+
+        return DDGraph(graph, x1.ue_mask, x1.n_idx, x1.e_idx)
+
+    def distance_features(self, latents: DDGraph) -> torch.Tensor:
+        """Morgan fingerprints, between which ABE measures Tanimoto distances. Molecules that RDKit
+        cannot fingerprint get an empty fingerprint, which is at distance 1 from everything."""
+        mols = self._graph_to_mols(self.base_model.postprocess(latents.to("cpu")))
+
+        fps = torch.zeros(len(mols), FINGERPRINT_SIZE)
+        for i, mol in enumerate(mols):
+            if mol is None:
+                continue
+
+            try:
+                mol.UpdatePropertyCache(strict=False)
+                Chem.FastFindRings(mol)
+                fps[i] = torch.from_numpy(MORGAN.GetFingerprintAsNumPy(mol).astype(np.float32))
+            except Exception:
+                pass
+
+        return fps
+
+    def distance(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Pairwise Tanimoto distances between fingerprints."""
+        inter = a @ b.T
+        union = a.sum(1, keepdim=True) + b.sum(1) - inter
+        return torch.where(union > 0, 1 - inter / union.clamp(min=1), torch.ones_like(inter))
 
     def postprocess_features(self, latents: DDGraph, feats: torch.Tensor) -> torch.Tensor:
         # `feats` is a tensor of shape (num_nodes, feature_dim), which we want to take the mean over
@@ -300,6 +391,17 @@ class QM9ProblemSetup(MoleculeProblemSetup):
 class GEOMDrugsProblemSetup(MoleculeProblemSetup):
     def __init__(self, args: dict, device: Optional[torch.device] = None):
         super().__init__(dataset="geom_drugs", args=args, device=device)
+
+
+def per_graph(x: DDGraph, values: torch.Tensor) -> DDGraph:
+    """Broadcasts one value per molecule of x to all of its node and edge features."""
+    graph = x._get_empty_graph()
+    for key in x.graph.ndata:
+        graph.ndata[key] = values[x.n_idx].unsqueeze(-1)
+    for key in x.graph.edata:
+        graph.edata[key] = values[x.e_idx].unsqueeze(-1)
+
+    return DDGraph(graph, x.ue_mask, x.n_idx, x.e_idx)
 
 
 def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff") -> dgl.DGLGraph:
