@@ -57,8 +57,10 @@ class ABEConfig:
     # Distillation
     distill_filter: Literal["lcb", "none"] = "lcb"
     safety_weight: float = 0.1       # lambda_s, x is confidently valid iff mu(x) - lambda_s sigma(x) >= 0
-    mix_weight: float = 0.5          # alpha
+    mix_weight: float = 0.5          # alpha, only used by the "rollback" trust region
+    trust: Literal["penalty", "rollback", "none"] = "penalty"  # adaptive Girsanov KL penalty, rollback of chunks past rho, or none
     trust_radius: float = 0.1        # rho
+    trust_coef: float = 1.0          # mu, initial weight of the "penalty", adapted to hit rho
     trust_direction: Literal["reverse", "forward"] = "reverse"  # KL(mu_theta || mu_theta') or KL(mu_theta' || mu_theta)
     distill_size: int = 1024
     distill_check_every: int = 50
@@ -73,6 +75,9 @@ class ABEConfig:
 
         if not (0 <= self.mix_weight <= 1):
             raise ValueError(f"mix_weight must be in [0, 1], got {self.mix_weight}")
+
+        if self.trust == "penalty" and self.trust_direction != "reverse":
+            raise ValueError("the penalty trust region requires trust_direction='reverse'")
 
         if not (0 <= self.frontier_frac <= 1):
             raise ValueError(f"frontier_frac must be in [0, 1], got {self.frontier_frac}")
@@ -114,6 +119,7 @@ class ABELoop(ExploreLoop[D]):
             self.abe = replace(self.abe, bridge="none")
 
         self._surrogate_fitted = False
+        self.trust_coef = self.abe.trust_coef
         if self.abe.bridge != "none":
             self.latent_shape = x.data.shape[1:]
             dim = x.data[0].numel()
@@ -287,15 +293,9 @@ class ABELoop(ExploreLoop[D]):
         return self.disperse(x, self.abe.smooth_bandwidth, reference="gaussian")
 
     def distill(self, bridge_endpoints: D, positives: D) -> dict[str, Any]:
-        """Distills alpha M_1 + (1 - alpha) mu_theta into the flow model for `ft_steps`,
-        with a trust region of radius rho: training stops early once a chunk moves the model further
-        than rho, and that chunk is rolled back. The distance moved is the Girsanov KL between the
-        path measures of the old and new model (`path_kl`), by default KL(P_old || P_new), which only
-        penalizes losing mass that the old model had.
-
-        With the "lcb" filter, only verified positives and confidently valid points are distilled:
-        the bridge part is resampled from the confidently valid endpoints and the positives, and the
-        model part from the confidently valid model samples (or the bridge part if there are none)."""
+        """Distills the bridge endpoints into the flow model for `ft_steps` within a trust region of
+        radius rho on the Girsanov KL between the path measures of the old and new model (`path_kl`),
+        by default KL(P_old || P_new), which only penalizes losing mass that the old model had."""
         n = self.abe.distill_size
         anchor = self.sample_model(n - len(bridge_endpoints))
         info: dict[str, Any] = {}
@@ -329,8 +329,16 @@ class ABELoop(ExploreLoop[D]):
             weight_decay=self.config.ft_weight_decay,
         )
 
+        old_model = copy.deepcopy(self.base_model).eval().requires_grad_(False)
+        if self.abe.trust in ("penalty", "none"):
+            return {
+                **info,
+                **self.distill_penalized(target_latents, old_model),
+                "target": target,
+                "target_bridge": len(bridge_endpoints),
+            }
+
         # For the reverse direction, the old model's paths are sampled once and reused for every check
-        old_model = copy.deepcopy(self.base_model).eval()
         old_paths = self.sample_paths(old_model, self.base_model) if self.abe.trust_direction == "reverse" else None
 
         steps = 0
@@ -366,6 +374,85 @@ class ABELoop(ExploreLoop[D]):
             "distill_moved": moved,
             "target": target,
             "target_bridge": len(bridge_endpoints),
+        }
+
+    def distill_penalized(self, target: D, old_model: BaseModel[D]) -> dict[str, Any]:
+        """Trains the flow model on `target` for `ft_steps` with the loss
+
+            L = L_FM(target) + mu KL(P_old || P_new),
+
+        where the Girsanov KL is estimated on states of `trust_samples` paths of the old model.
+        """
+        if self.abe.trust == "none":
+            self.trust_coef = 0.0
+
+        rho = self.abe.trust_radius
+        bs = self.config.ft_batch_size
+        accumulate_steps = self.config.ft_accumulate_steps
+
+        paths = self.sample_paths(old_model, self.base_model)
+        env = self._path_env(old_model, self.base_model)
+        span = (paths.timesteps[-1] - paths.timesteps[0]).item()
+
+        opt = torch.optim.AdamW(
+            self.base_model.parameters(),
+            lr=self.config.ft_lr,
+            weight_decay=self.config.ft_weight_decay,
+        )
+
+        fm_sum = 0.0
+        penalty_sum = 0.0
+        kl = 0.0
+        self.base_model.train()
+        opt.zero_grad()
+        for step in range(1, self.config.ft_steps + 1):
+            x1 = take(target, torch.randint(len(target), (bs,))).to(self.device)
+            fm = self.base_model.train_loss(x1).mean()
+
+            # int_0^1 L(x_t, t) dt is span times the mean running cost at a uniform grid time. 
+            penalty = torch.zeros((), device=self.device)
+            if self.abe.trust == "penalty":
+                i = int(torch.randint(len(paths.timesteps) - 1, ()))
+                xt = take(paths.trajectory[i], torch.randint(len(paths), (bs,))).to(self.device)
+                t = paths.timesteps[i].item() * torch.ones(bs, device=self.device)
+                _, running_cost = env.drift(xt, t)
+                penalty = span * running_cost.mean()
+
+            loss = fm + self.trust_coef * penalty
+            (loss / accumulate_steps).backward()
+            if step % accumulate_steps == 0:
+                # Same clipping as `train_base_model`
+                torch.nn.utils.clip_grad_norm_(self.base_model.parameters(), 0.1)
+                opt.step()
+                opt.zero_grad()
+
+            fm_sum += fm.item()
+            penalty_sum += penalty.item()
+
+            if step % self.abe.distill_check_every == 0 or step == self.config.ft_steps:
+                self.base_model.eval()
+                kl = self.path_kl(old_model, self.base_model, paths)
+                self.base_model.train()
+
+                if self.abe.trust != "penalty":
+                    continue
+
+                if kl > 1.5 * rho:
+                    self.trust_coef *= 2
+                elif kl < rho / 1.5:
+                    self.trust_coef /= 2
+
+                # Keeps mu from running away while the model does not move, e.g., without data
+                self.trust_coef = min(max(self.trust_coef, 1e-4), 1e4)
+
+        self.base_model.eval()
+        steps = max(1, self.config.ft_steps)
+        return {
+            "distill_steps": self.config.ft_steps,
+            "distill_moved": kl,
+            "distill_fm": fm_sum / steps,
+            "distill_penalty": penalty_sum / steps,
+            "trust_coef": self.trust_coef,
         }
 
     def _path_env(self, p: BaseModel[D], q: BaseModel[D]) -> Environment[D]:
@@ -500,7 +587,7 @@ class ABELoop(ExploreLoop[D]):
 
             # Distill the bridge into the flow model (line 12)
             with self._timer("finetune"):
-                num_bridge = round(cfg.mix_weight * cfg.distill_size)
+                num_bridge = round(cfg.mix_weight * cfg.distill_size) if cfg.trust == "rollback" else cfg.distill_size
                 bridge_endpoints = self.propose(num_bridge, target, target_weights)
                 distilled = self.distill(bridge_endpoints, self.positives(batches))
                 metrics.update({k: v for k, v in distilled.items() if k not in ("target", "target_bridge")})
@@ -751,7 +838,9 @@ def add_abe_args(parser):
     parser.add_argument("--abe_distill_filter", type=str, choices=["lcb", "none"], default=defaults.distill_filter)
     parser.add_argument("--abe_safety_weight", type=float, default=defaults.safety_weight, help="lambda_s")
     parser.add_argument("--abe_mix_weight", type=float, default=defaults.mix_weight, help="alpha")
+    parser.add_argument("--abe_trust", type=str, choices=["penalty", "rollback", "none"], default=defaults.trust)
     parser.add_argument("--abe_trust_radius", type=float, default=defaults.trust_radius, help="rho")
+    parser.add_argument("--abe_trust_coef", type=float, default=defaults.trust_coef, help="mu")
     parser.add_argument("--abe_trust_direction", type=str, choices=["reverse", "forward"], default=defaults.trust_direction)
     parser.add_argument("--abe_distill_size", type=int, default=defaults.distill_size)
     parser.add_argument("--abe_distill_check_every", type=int, default=defaults.distill_check_every)
