@@ -14,7 +14,19 @@ from diffusiongym.utils import train_base_model, dict_to_device
 from diffusiongym.base_models.one_dim_gmm import MLP
 
 from .explore import ExploreLoop, build_loop, build_parser
+from .path_cost import (
+    OracleStateCost, bridge_points, path_log_weight, per_step_scale, simulate_path,
+    surrogate_state_cost, tilt_weights_with_offset,
+)
 from .utils import Batch, write_video
+
+
+# Per-round metrics kept in the summary when the problem defines a shortcut region
+HISTORY_KEYS = (
+    "mu_band", "mu_band_A", "mu_cross_A", "mu_A", "pool_band", "pool_cross", "pool_left", "band_known",
+    "path_alive", "path_cost", "beta", "ess", "ess_alive", "query_valid", "query_A", "query_A_cross",
+    "query_A_dirty", "lineage_alive", "repriced_mass",
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +37,15 @@ class ABEConfig:
     reference: Literal["gaussian", "student", "levy", "poisson"] = "gaussian"
     reference_df: float = 2.0        # degrees of freedom of "student"
     reference_alpha: float = 1.5     # stability index of "levy", in (0, 2]
+    disperse_steps: int = 1          # increments the dispersal of line 4 is simulated in; 1 is a single displacement
+
+    # State cost V of the reference (Feynman-Kac). Only has an effect with disperse_steps > 1,
+    # since a single displacement has no intermediate states to charge.
+    state_cost: Literal["none", "surrogate", "oracle"] = "none"  # "oracle" is a diagnostic upper bound
+    state_cost_form: Literal["surprise", "excess"] = "surprise"  # -log P(valid), or only its excess over the prior
+    state_cost_weight: float = 1.0   # weight on -log P(valid) along the path
+    state_cost_hard: bool = False    # also kill a path that crosses mu + lambda sigma < 0
+    lineage: bool = False            # re-price each positive's ancestral paths under the current cost
     jump_rate: float = 0.2           # Poisson rate of jumps per unit time for "poisson"
     jump_scale: float = 1.0          # standard deviation of each jump for "poisson"
     max_jump: float = 5.0            # cap on the norm of a dispersal step, for heavy tails
@@ -33,15 +54,17 @@ class ABEConfig:
     frontier_frac: float = 0.5       # fraction of the pool that starts at positives instead of mu_theta
 
     # Surrogate and tilt
-    acquisition: Literal["uncertainty", "ucb"] = "uncertainty"
+    acquisition: Literal["uncertainty", "ucb", "diversity"] = "uncertainty"
     feasibility_weight: float = 0.25 # lambda, x is feasible iff mu(x) + lambda sigma(x) >= 0
     standardize_labels: bool = False # otherwise, validity labels are centred to +-0.5
     tilt: float = 5.0                # beta_t
     kappa: float = 1.0               # exploration weight of "ucb"
     ess_min: float = 0.1             # floor on ESS(w) / N
+    ess_over_alive: bool = False     # ESS as a fraction of the paths left alive, not of N
 
     # Target and bridge
     pool_size: int = 1024            # N
+    positive_mass: Optional[float] = None  # gamma, total mass of D^+ in the target; None gives each positive a pool particle's mass
     smooth_bandwidth: float = 0.02   # bandwidth h of Smooth
     bridge: Literal["cfm", "sb", "none"] = "cfm"
     bridge_steps: int = 500
@@ -53,6 +76,7 @@ class ABEConfig:
     proposal_size: int = 256         # B'
     query_budget: int = 16           # B
     exclusion_radius: float = 0.05   # delta
+    select_path_weight: bool = False # rank candidates by the target's logit beta alpha + log w, not by alpha alone
 
     # Distillation
     distill_filter: Literal["lcb", "none"] = "lcb"
@@ -68,8 +92,18 @@ class ABEConfig:
 
     # Diagnostics
     save_rounds: bool = False        # save pool, proposals, selection, and model samples per round
+    diagnostic_substeps: int = 8     # Brownian bridge points between recorded states for the crossing diagnostics
 
     def __post_init__(self):
+        if self.positive_mass is not None and not (0 <= self.positive_mass < 1):
+            raise ValueError(f"positive_mass must be in [0, 1), got {self.positive_mass}")
+
+        if (self.lineage or self.select_path_weight) and self.bridge != "none":
+            raise ValueError(
+                "lineage and select_path_weight need each candidate's pool path, which only "
+                "bridge='none' keeps: a fitted bridge proposes from fresh model samples"
+            )
+
         if not (0 < self.step_size < 1):
             raise ValueError(f"step_size must be in (0, 1), got {self.step_size}")
 
@@ -78,6 +112,16 @@ class ABEConfig:
 
         if self.trust == "penalty" and self.trust_direction != "reverse":
             raise ValueError("the penalty trust region requires trust_direction='reverse'")
+
+        if self.disperse_steps < 1:
+            raise ValueError(f"disperse_steps must be at least 1, got {self.disperse_steps}")
+
+        if self.state_cost != "none" and self.disperse_steps == 1:
+            raise ValueError(
+                "a state cost needs disperse_steps > 1: a single displacement has no intermediate "
+                "states to charge, so V would only ever be evaluated at the pool's endpoints, which "
+                "the feasibility mask of line 5 already does"
+            )
 
         if not (0 <= self.frontier_frac <= 1):
             raise ValueError(f"frontier_frac must be in [0, 1], got {self.frontier_frac}")
@@ -119,9 +163,23 @@ class ABELoop(ExploreLoop[D]):
             self.abe = replace(self.abe, bridge="none")
 
         self._surrogate_fitted = False
+        self._positive_feats: Optional[torch.Tensor] = None
+
+        # Per positive, in the order of `positives`: the positive whose frontier particle found it
+        # (-1 for a model sample), and the recorded paths, as (indices, states) chunks
+        self._lineage_parent: list[int] = []
+        self._lineage_paths: list[tuple[torch.Tensor, list]] = []
+
+        # Oracle crossing diagnostics, on problems that define a shortcut region. Positives are
+        # "clean" if neither their own path nor any ancestor's passed through it.
+        self._diagnose = isinstance(x, DDTensor) and hasattr(self.problem, "in_shortcut")
+        self._diag_gen = torch.Generator().manual_seed(torch.initial_seed() % 2**63)
+        self._pos_clean: list[bool] = []
         self.trust_coef = self.abe.trust_coef
-        if self.abe.bridge != "none":
+        if isinstance(x, DDTensor):
             self.latent_shape = x.data.shape[1:]
+
+        if self.abe.bridge != "none":
             dim = x.data[0].numel()
             self.bridge = MLP(dim, dim).to(self.base_model.device)
             self.bridge_opt = torch.optim.Adam(self.bridge.parameters(), lr=self.abe.bridge_lr)
@@ -153,16 +211,67 @@ class ABELoop(ExploreLoop[D]):
         sample = self.env.batch_sample(n, self.config.sample_batch_size)
         return self.problem.postprocess_latents(Batch.from_sample(sample)).to(self.device)
 
-    def disperse(self, x: D, scale: float, reference: Optional[str] = None) -> D:
+    def disperse(self, x: D, scale: float, reference: Optional[str] = None, cfg: Optional[ABEConfig] = None) -> D:
         """Disperses latents under the reference Q with the given scale (line 4). The problem setup
-        decides how a displacement acts on its latents."""
+        decides how a displacement acts on its latents.
+
+        `cfg` overrides the reference parameters for this increment, which `disperse_path` uses to
+        thin the Poisson rate when it splits a dispersal into steps."""
         if len(x) == 0 or scale <= 0:
             return x
 
+        ref_cfg = cfg if cfg is not None else self.abe
+
         def noise(n: int, d: int) -> torch.Tensor:
-            return sample_reference(n, d, scale, self.abe, self.device, reference)
+            return sample_reference(n, d, scale, ref_cfg, self.device, reference)
 
         return self.problem.disperse(self.env, x, scale, noise)
+
+    def state_cost(self, has_data: bool) -> Optional[Any]:
+        """The state cost V of line 4, or None when the reference carries no cost. Needs a fitted
+        surrogate, so the first rounds disperse under the plain reference."""
+        if self.abe.state_cost == "oracle":
+            # Known from the first round, which is the point of it: see OracleStateCost
+            return OracleStateCost(
+                lambda x: self.problem.validity(self.base_model.postprocess(x), {}),
+                self.abe.state_cost_weight,
+                self.abe.state_cost_hard,
+                self.device,
+            )
+
+        if self.abe.state_cost == "none" or not has_data or self.config.no_uncertainty:
+            return None
+
+        if not self._surrogate_fitted:
+            return None
+
+        return surrogate_state_cost(
+            self.uncertainty.mean_and_uncertainty,
+            self.abe.state_cost_weight,
+            self.abe.state_cost_hard,
+            self.abe.feasibility_weight,
+            self.device,
+            form=self.abe.state_cost_form,
+        )
+
+    def disperse_path(
+        self, x: D, scale: float, has_data: bool, monitor: Optional[Callable[[int, D], None]] = None,
+    ) -> tuple[D, torch.Tensor, dict[str, float]]:
+        """Simulates the dispersal of line 4 as a path and returns the endpoint together with the
+        Feynman-Kac log weight exp(-int V) that turns the pool into a sample of rho_t K^V_tau.
+
+        With `disperse_steps = 1` and no state cost this is the single displacement of the original
+        line 4 and the weights are zero, so the default path through the loop is unchanged."""
+        return simulate_path(
+            x,
+            scale,
+            self.abe.disperse_steps,
+            lambda y, s, c: self.disperse(y, s, cfg=c),
+            self.abe,
+            self.state_cost(has_data),
+            self.device,
+            monitor,
+        )
 
     @torch.no_grad()
     def features(self, x: D) -> torch.Tensor:
@@ -194,7 +303,16 @@ class ABELoop(ExploreLoop[D]):
         if self.abe.acquisition == "ucb":
             return mean + self.abe.kappa * uncert, feasible
 
-        return uncert, mean + self.abe.feasibility_weight * uncert >= 0
+        loose = mean + self.abe.feasibility_weight * uncert >= 0
+        if self.abe.acquisition == "diversity":
+            # Distance to the nearest verified positive, so the tilt rewards leaving D^+ rather than
+            # being uncertain about it. Falls back to uncertainty until there are positives to be
+            # far from.
+            feats = self._positive_feats
+            if feats is not None and len(feats) > 0:
+                return self.distance(self.features(x), feats).min(dim=1).values, loose
+
+        return uncert, loose
 
     @torch.no_grad()
     def confidently_valid(self, x: D) -> torch.Tensor:
@@ -286,11 +404,89 @@ class ABELoop(ExploreLoop[D]):
     def propose(self, n: int, target: D, target_weights: torch.Tensor) -> D:
         """Draws n samples of the bridge endpoint M_1 (line 9). Without a bridge, M_1 = mu*: the
         target is resampled and smoothed with a Gaussian dispersal of bandwidth h."""
-        if self.abe.bridge != "none":
-            return self.simulate_bridge(self.sample_model(n))  # type: ignore
+        return self.propose_indexed(n, target, target_weights)[0]
 
-        x = take(target, torch.multinomial(target_weights, n, replacement=True))
-        return self.disperse(x, self.abe.smooth_bandwidth, reference="gaussian")
+    def propose_indexed(self, n: int, target: D, target_weights: torch.Tensor) -> tuple[D, torch.Tensor]:
+        """`propose`, together with the index into `target` that each proposal was resampled from,
+        or -1 when a bridge proposes from fresh model samples and there is no such particle."""
+        if self.abe.bridge != "none":
+            return self.simulate_bridge(self.sample_model(n)), torch.full((n,), -1, device=self.device)  # type: ignore
+
+        idx = torch.multinomial(target_weights, n, replacement=True)
+        return self.disperse(take(target, idx), self.abe.smooth_bandwidth, reference="gaussian"), idx
+
+    def mix_target(self, weights: torch.Tensor, num_positives: int, positive_log_w: Optional[torch.Tensor]) -> torch.Tensor:
+        """Weights of the target `cat([pool, positives])` (line 7).
+
+        With `positive_mass` unset each positive weighs as much as a pool particle, so D^+ takes a
+        share |D^+| / (N + |D^+|) of the target that grows every round, and its points carry neither
+        the tilt nor a path weight. With gamma set the pool keeps 1 - gamma whatever |D^+| is, and
+        gamma = 0 leaves exactly mu*, the frontier already dispersing from D^+. The positives' share
+        is spread by their lineage weight, uniformly without one.
+        """
+        cfg = self.abe
+        if cfg.positive_mass is None:
+            target_weights = torch.cat([len(weights) * weights, torch.ones(num_positives, device=self.device)])
+            return target_weights / target_weights.sum()
+
+        gamma = cfg.positive_mass if num_positives > 0 else 0.0
+        pos = torch.full((num_positives,), 1.0 / max(1, num_positives), device=self.device)
+        if positive_log_w is not None and positive_log_w.isfinite().any():
+            pos = torch.softmax(positive_log_w, dim=0)
+
+        return torch.cat([(1 - gamma) * weights, gamma * pos])
+
+    def lineage_log_weight(self, has_data: bool) -> Optional[torch.Tensor]:
+        """Log weight of every positive's whole ancestry under the *current* cost, or None.
+
+        A positive found by a frontier particle inherits its parent's weight, so this is the
+        Feynman-Kac weight of the concatenated path back to a model sample. That is what makes
+        "reached through valid regions" hold across rounds and not only within one: a target found
+        in round 1 by crossing a wall nobody had measured yet is pruned the moment the surrogate
+        learns the wall, instead of serving as a clean frontier start for ever after.
+
+        Model samples start a lineage clean, since the flow model keeps no record of how its mass
+        got where it is. That is the remaining leak, and why distillation filters on lineage too.
+        """
+        if not self.abe.lineage or len(self._lineage_parent) == 0:
+            return None
+
+        n = len(self._lineage_parent)
+        own = torch.zeros(n, device=self.device)
+        cost = self.state_cost(has_data)
+        if cost is not None:
+            for idx, states in self._lineage_paths:
+                own[idx] = path_log_weight(states, cost, self.device)
+
+        total = own.tolist()
+        for j, parent in enumerate(self._lineage_parent):
+            if parent >= 0:
+                total[j] += total[parent]
+
+        return torch.tensor(total, device=self.device)
+
+    @torch.no_grad()
+    def crossings(self, states: list, step_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Oracle diagnostics of recorded paths: whether each passes through the problem's shortcut
+        region, and whether it leaves the valid set at all. Measured on the recorded states and on
+        `diagnostic_substeps` Brownian bridge points between each pair, so that a crossing between
+        two of the cost's own states is still seen. Uses a private generator: observing a run must
+        not change it."""
+        m = self.abe.diagnostic_substeps if self.abe.reference == "gaussian" else 0
+        pts = [self._flat(x) for x in states]
+        checks = list(pts)
+        for a, b in zip(pts[:-1], pts[1:]):
+            if m > 0:
+                checks.extend(bridge_points(a, b, step_scale, m, self._diag_gen).unbind(0))
+
+        band = torch.zeros(len(pts[0]), dtype=torch.bool, device=self.device)
+        left = torch.zeros_like(band)
+        for x in checks:
+            samples = self.base_model.postprocess(self._unflat(x))
+            band |= self.problem.in_shortcut(samples).to(self.device)
+            left |= ~self.problem.validity(samples, {}).to(self.device).bool()
+
+        return band, left
 
     def distill(self, bridge_endpoints: D, positives: D) -> dict[str, Any]:
         """Distills the bridge endpoints into the flow model for `ft_steps` within a trust region of
@@ -503,6 +699,9 @@ class ABELoop(ExploreLoop[D]):
         total_samples = 0
         total_valid_samples = 0
         samples_to_solve = None
+        samples_to_solve_clean = None
+        totals = {"query_A": 0, "query_A_cross": 0, "query_A_dirty": 0}
+        history: list[dict[str, float]] = []
 
         for i in range(num_iterations):
             with self._timer("eval"):
@@ -518,29 +717,61 @@ class ABELoop(ExploreLoop[D]):
             with self._timer("disperse"):
                 source = self.sample_model(cfg.pool_size)
                 positives = self.positives(batches) if has_data else take(source, torch.arange(0))
+                lineage_log_w = self.lineage_log_weight(has_data)
 
                 num_frontier = round(cfg.frontier_frac * cfg.pool_size) if len(positives) > 0 else 0
                 starts = take(source, torch.arange(cfg.pool_size - num_frontier))
+                start_parent = torch.full((cfg.pool_size - num_frontier,), -1, dtype=torch.long)
                 if num_frontier > 0:
                     frontier_score, _ = self.acquisition(positives, has_data)
-                    frontier_weights, _ = tilt_weights(frontier_score, cfg.tilt, cfg.ess_min)
-                    frontier = take(positives, torch.multinomial(frontier_weights, num_frontier, replacement=True))
-                    starts = cat([starts, frontier])
+                    if lineage_log_w is None:
+                        frontier_weights, _ = tilt_weights(frontier_score, cfg.tilt, cfg.ess_min)
+                    else:
+                        # Resampling the frontier by lineage weight is the resampling step of the
+                        # particle system, so the pool it seeds needs no further correction
+                        frontier_weights, _ = tilt_weights_with_offset(
+                            frontier_score, cfg.tilt, cfg.ess_min, lineage_log_w
+                        )
+                    frontier_idx = torch.multinomial(frontier_weights, num_frontier, replacement=True)
+                    starts = cat([starts, take(positives, frontier_idx)])
+                    start_parent = torch.cat([start_parent, frontier_idx.cpu()])
 
-                pool = self.disperse(starts, math.sqrt(cfg.step_size * cfg.disperse_time))
+                self._positive_feats = self.features(positives) if len(positives) > 0 else None
+                states: list = []
+                scale = math.sqrt(cfg.step_size * cfg.disperse_time)
+                pool, path_log_w, path_info = self.disperse_path(
+                    starts, scale, has_data,
+                    (lambda k, x: states.append(x)) if (self._diagnose or cfg.lineage) else None,
+                )
                 pool_score, pool_feasible = self.acquisition(pool, has_data)
-                weights, beta = tilt_weights(pool_score, cfg.tilt, cfg.ess_min, pool_feasible)
+                weights, beta = tilt_weights_with_offset(
+                    pool_score, cfg.tilt, cfg.ess_min, path_log_w, pool_feasible, cfg.ess_over_alive
+                )
+
+                pool_cross = None
+                if self._diagnose:
+                    step_scale = per_step_scale(scale, cfg.disperse_steps, cfg.reference, cfg.reference_alpha)
+                    pool_band, pool_left = self.crossings(states, step_scale)
+                    # A crossing joins the two sides: through the band, with one end in A and the
+                    # other not. A path that leaves A, dips into the band below it and returns is an
+                    # excursion like any other, not a shortcut.
+                    side = [self.problem.in_target(self.base_model.postprocess(s)).to(self.device) for s in (states[0], states[-1])]
+                    pool_cross = pool_band & (side[0] != side[1])
+                    metrics.update(self.pool_diagnostics(pool, weights, pool_band, pool_cross, pool_left))
 
             # Build the target from the tilted pool and the positives, and fit the bridge (lines 7-8)
             with self._timer("bridge"):
                 target = cat([pool, positives])
-                target_weights = torch.cat([len(pool) * weights, torch.ones(len(positives), device=self.device)])
-                target_weights = target_weights / target_weights.sum()
+                target_weights = self.mix_target(weights, len(positives), lineage_log_w)
+                target_offset = torch.cat([
+                    path_log_w,
+                    lineage_log_w if lineage_log_w is not None else torch.zeros(len(positives), device=self.device),
+                ])
                 bridge_loss = self.fit_bridge(source, target, target_weights)
 
             # Propose candidates from the bridge endpoint (line 9)
             with self._timer("propose"):
-                candidates = self.propose(cfg.proposal_size, target, target_weights)
+                candidates, cand_idx = self.propose_indexed(cfg.proposal_size, target, target_weights)
 
             # Select a diverse batch with high acquisition (line 10)
             with self._timer("select"):
@@ -548,9 +779,15 @@ class ABELoop(ExploreLoop[D]):
                 if not cand_feasible.any():
                     cand_feasible = torch.ones_like(cand_feasible)
 
+                # Ranking by alpha alone discards the path weight: a candidate is only ever in or
+                # out of the resample. The target's own logit beta alpha + log w keeps it.
+                rank = cand_score
+                if cfg.select_path_weight:
+                    rank = beta * cand_score + target_offset[cand_idx]
+
                 selected = greedy_diverse(
                     self.features(candidates),
-                    cand_score.masked_fill(~cand_feasible, float("-inf")),
+                    rank.masked_fill(~cand_feasible, float("-inf")),
                     cfg.query_budget,
                     cfg.exclusion_radius,
                     self.distance,
@@ -565,6 +802,16 @@ class ABELoop(ExploreLoop[D]):
                 if solved and samples_to_solve is None:
                     samples_to_solve = total_samples
 
+                query_diag = self.record_positives(
+                    batch, cand_idx[selected], len(pool), start_parent, states, pool_cross, positives
+                )
+                if self._diagnose:
+                    metrics.update(query_diag)
+                    for k in ("query_A", "query_A_cross", "query_A_dirty"):
+                        totals[k] += query_diag[k]
+                    if query_diag["query_A"] > query_diag["query_A_dirty"] and samples_to_solve_clean is None:
+                        samples_to_solve_clean = total_samples
+
             batches.append(batch)
 
             with self._timer("visualize"):
@@ -576,7 +823,9 @@ class ABELoop(ExploreLoop[D]):
                 metrics["frontier"] = num_frontier
                 metrics["pool_feasible"] = pool_feasible.float().mean().item()
                 metrics["beta"] = beta
+                metrics.update(path_info)
                 metrics["ess"] = effective_sample_size(weights)
+                metrics["ess_alive"] = metrics["ess"] * len(weights) / max(1, int(path_log_w.isfinite().sum()))
                 metrics["bridge_loss"] = bridge_loss
 
             # Update the surrogate on D_{t+1} already (line 3 of the next round), such that the
@@ -588,9 +837,19 @@ class ABELoop(ExploreLoop[D]):
             # Distill the bridge into the flow model (line 12)
             with self._timer("finetune"):
                 num_bridge = round(cfg.mix_weight * cfg.distill_size) if cfg.trust == "rollback" else cfg.distill_size
-                bridge_endpoints = self.propose(num_bridge, target, target_weights)
-                distilled = self.distill(bridge_endpoints, self.positives(batches))
+                distill_positives = self.positives(batches)
+                distill_weights = target_weights
+                if cfg.lineage:
+                    distill_weights, distill_positives, lineage_info = self.reprice_for_distill(
+                        weights, path_log_w, states, positives, distill_positives
+                    )
+                    metrics.update(lineage_info)
+
+                bridge_endpoints = self.propose(num_bridge, target, distill_weights)
+                distilled = self.distill(bridge_endpoints, distill_positives)
                 metrics.update({k: v for k, v in distilled.items() if k not in ("target", "target_bridge")})
+                if self._diagnose:
+                    history.append({k: metrics[k] for k in HISTORY_KEYS if k in metrics})
 
             if cfg.save_rounds:
                 # Particles are saved as their distance features, i.e., coordinates for tensor latents
@@ -630,13 +889,131 @@ class ABELoop(ExploreLoop[D]):
             fps=self.config.video_fps,
         )
 
-        return {
+        summary = {
             "iterations": i + 1,
             "num_samples": total_samples,
             "num_valid_samples": total_valid_samples,
             "solved": samples_to_solve is not None,
             "samples_to_solve": samples_to_solve,
         }
+        if self._diagnose:
+            summary.update({
+                "samples_to_solve_clean": samples_to_solve_clean,
+                "positives_A": totals["query_A"],
+                "positives_A_cross": totals["query_A_cross"],
+                "positives_A_dirty": totals["query_A_dirty"],
+                "rounds": history,
+            })
+
+        return summary
+
+    def pool_diagnostics(
+        self, pool: D, weights: torch.Tensor, band: torch.Tensor, cross: torch.Tensor, left: torch.Tensor,
+    ) -> dict[str, float]:
+        """How much of mu* the pool's paths carry across the shortcut region, measured by the
+        oracle. `mu_cross_A` is the quantity a path cost exists to drive down: target mass on valid
+        endpoints in A whose path got there by crossing from the other side. `band_known` is the
+        share of the shortcut region the surrogate's own hard rule already calls invalid, i.e. how
+        much of the wall a surrogate cost can see at all."""
+        samples = self.base_model.postprocess(pool)
+        in_A = self.problem.in_target(samples).to(self.device) & self.problem.validity(samples, {}).to(self.device).bool()
+        out = {
+            "pool_left": left.float().mean().item(),
+            "pool_band": band.float().mean().item(),
+            "pool_cross": cross.float().mean().item(),
+            "mu_band": weights[band].sum().item(),
+            "mu_A": weights[in_A].sum().item(),
+            "mu_band_A": weights[band & in_A].sum().item(),
+            "mu_cross_A": weights[cross & in_A].sum().item(),
+        }
+
+        box = getattr(self.problem, "shortcut_box", None)
+        if box is not None and self._surrogate_fitted and not self.config.no_uncertainty:
+            xmin, xmax, ymin, ymax = box
+            gx, gy = torch.meshgrid(torch.linspace(xmin, xmax, 21), torch.linspace(ymin, ymax, 7), indexing="ij")
+            grid = DDTensor(torch.stack([gx.flatten(), gy.flatten()], dim=1).reshape(-1, *self.latent_shape)).to(self.device)
+            mean, unc = self.uncertainty.mean_and_uncertainty(grid)
+            out["band_known"] = (mean + self.abe.feasibility_weight * unc < 0).float().mean().item()
+
+        return out
+
+    def record_positives(
+        self, batch: Batch[D], target_idx: torch.Tensor, num_pool: int, start_parent: torch.Tensor,
+        states: list, pool_cross: Optional[torch.Tensor], positives: D,
+    ) -> dict[str, float]:
+        """Appends the lineage of this round's positives: the positive whose frontier particle found
+        each (-1 for a model sample), with `lineage` its path, and the oracle's verdict on whether it
+        or any ancestor crossed. A candidate resampled from D^+ itself has a jitter of bandwidth h
+        for a path and the positive it came from as its parent."""
+        valid = batch.valids.to(self.device)
+        new = valid.nonzero().squeeze(1)
+        tidx = target_idx[new].tolist()
+        first = len(self._lineage_parent)
+
+        parents, own_cross = [], []
+        for t in tidx:
+            if 0 <= t < num_pool:
+                parents.append(int(start_parent[t]))
+                own_cross.append(bool(pool_cross[t]) if pool_cross is not None else False)
+            else:
+                parents.append(t - num_pool if t >= num_pool else -1)
+                own_cross.append(False)
+
+        clean = [not b and (p < 0 or self._pos_clean[p]) for p, b in zip(parents, own_cross)]
+        self._lineage_parent.extend(parents)
+        self._pos_clean.extend(clean)
+
+        if self.abe.lineage and len(new) > 0:
+            t = torch.tensor(tidx, device=self.device)
+            gidx = torch.arange(first, first + len(new), device=self.device)
+            from_pool = (t >= 0) & (t < num_pool)
+            if from_pool.any():
+                self._lineage_paths.append((gidx[from_pool], [take(s, t[from_pool]) for s in states]))
+
+            from_pos = t >= num_pool
+            if from_pos.any():
+                ends = take(batch.latents.to(self.device), new[from_pos])
+                self._lineage_paths.append((gidx[from_pos], [take(positives, t[from_pos] - num_pool), ends]))
+
+        if not self._diagnose:
+            return {}
+
+        in_A = self.problem.in_target(batch.samples).to(self.device)[new].tolist()
+        return {
+            "query_A": sum(in_A),
+            "query_A_cross": sum(a and b for a, b in zip(in_A, own_cross)),
+            "query_A_dirty": sum(a and not c for a, c in zip(in_A, clean)),
+        }
+
+    def reprice_for_distill(
+        self, weights: torch.Tensor, path_log_w: torch.Tensor, states: list, positives: D, all_positives: D,
+    ) -> tuple[torch.Tensor, D, dict[str, float]]:
+        """Re-prices the round's target under the surrogate as updated by this round's labels, for
+        distillation (line 12). The pool was weighted with the cost of the round's *start*, so a
+        wall learnt from this very batch would otherwise only take effect a round late -- by which
+        time the model has been trained on what crossed it. Positives whose lineage is now dead are
+        dropped from the distillation set."""
+        cost = self.state_cost(True)
+        lineage = self.lineage_log_weight(True)
+
+        new_weights = weights
+        if cost is not None and len(states) > 0:
+            alive = weights > 0
+            logits = torch.full_like(weights, float("-inf"))
+            logits[alive] = weights[alive].log() - path_log_w[alive] + path_log_weight(states, cost, self.device)[alive]
+            if logits.isfinite().any():
+                new_weights = torch.softmax(logits, dim=0)
+
+        lineage_pos = lineage[: len(positives)] if lineage is not None else None
+        distill_weights = self.mix_target(new_weights, len(positives), lineage_pos)
+
+        info = {"repriced_mass": (new_weights - weights).abs().sum().item() / 2}
+        if lineage is not None and len(lineage) > 0:
+            keep = lineage.isfinite()
+            info["lineage_alive"] = keep.float().mean().item()
+            all_positives = take(all_positives, keep.nonzero().squeeze(1))
+
+        return distill_weights, all_positives, info
 
 
 class Empty:
@@ -819,7 +1196,26 @@ def add_abe_args(parser):
     parser.add_argument("--abe_jump_scale", type=float, default=defaults.jump_scale)
     parser.add_argument("--abe_max_jump", type=float, default=defaults.max_jump)
     parser.add_argument("--abe_frontier_frac", type=float, default=defaults.frontier_frac)
-    parser.add_argument("--abe_acquisition", type=str, choices=["uncertainty", "ucb"], default=defaults.acquisition)
+    parser.add_argument("--abe_disperse_steps", type=int, default=defaults.disperse_steps,
+                        help="Increments the dispersal of line 4 is simulated in; >1 is needed for any state cost")
+    parser.add_argument("--abe_state_cost", type=str, choices=["none", "surrogate", "oracle"], default=defaults.state_cost,
+                        help="V in the Feynman-Kac reference: 'surrogate' charges -log P(valid) along the path, "
+                             "'oracle' reads true validity (a diagnostic: its calls are not budgeted)")
+    parser.add_argument("--abe_state_cost_form", type=str, choices=["surprise", "excess"], default=defaults.state_cost_form,
+                        help="'excess' charges only -log P(valid) beyond the prior's log 2, so unknown space is free")
+    parser.add_argument("--abe_state_cost_weight", type=float, default=defaults.state_cost_weight)
+    parser.add_argument("--abe_state_cost_hard", action="store_true",
+                        help="Also kill a path that crosses mu + lambda sigma < 0, i.e. prune it")
+    parser.add_argument("--abe_lineage", action="store_true",
+                        help="Re-price every positive's ancestral paths under the current cost, for the frontier, target and distillation")
+    parser.add_argument("--abe_ess_over_alive", action="store_true",
+                        help="Measure the ESS floor against the paths left alive rather than the whole pool")
+    parser.add_argument("--abe_positive_mass", type=float, default=defaults.positive_mass,
+                        help="gamma, total mass of the positives in the target; unset gives each one a pool particle's mass")
+    parser.add_argument("--abe_select_path_weight", action="store_true",
+                        help="Rank candidates by beta alpha + log w, so the path weight reaches the queries")
+    parser.add_argument("--abe_diagnostic_substeps", type=int, default=defaults.diagnostic_substeps)
+    parser.add_argument("--abe_acquisition", type=str, choices=["uncertainty", "ucb", "diversity"], default=defaults.acquisition)
     parser.add_argument("--abe_feasibility_weight", type=float, default=defaults.feasibility_weight, help="lambda")
     parser.add_argument("--abe_standardize_labels", action="store_true")
     parser.add_argument("--abe_tilt", type=float, default=defaults.tilt, help="beta_t")

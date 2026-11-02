@@ -226,3 +226,4 @@ slurm-*
 
 # reports
 reports/
+tests/
