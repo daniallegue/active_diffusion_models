@@ -77,15 +77,37 @@ ABLATION: dict[str, dict[str, Any]] = {
     "abe-soft+all": {**_SOFT, **_MASS, **_EXCESS, **_SELECT, **_LINEAGE, **_ESS},
     "abe-oracle+all": {**_ORACLE, **_MASS, **_SELECT, **_LINEAGE, **_ESS},
 }
-ALL_ARMS = {**ARMS, **ABLATION}
+
+# The reference measures Q of abe_corridor §8.1, at the parameters tested there. Every one is spelt
+# out in full, Gaussian included, so a cell never inherits the reference from the command line.
+REFERENCES: dict[str, dict[str, Any]] = {
+    "gaussian": {"abe_reference": "gaussian"},
+    "student": {"abe_reference": "student", "abe_reference_df": 2.0},
+    "levy": {"abe_reference": "levy", "abe_reference_alpha": 1.0},
+    "poisson": {"abe_reference": "poisson"},
+}
+
+# The scale-up of the islands and the corridor: the best ABE so far, crossed with each reference.
+#
+#   abe+mass@Q       No path cost, single displacement, positives carry no mass in the target (P3,
+#                    which helped in every seed pair). The arm that can reach the disconnected
+#                    islands at all: with no valid route, any path cost can only forbid A.
+#   abe-hard+all@Q   The best path-cost arm of degenerate_fixes.md. On the islands its honest
+#                    outcome is to stop reaching A once the surrogate has learnt the gap.
+SCALE: dict[str, dict[str, Any]] = {
+    f"{base}@{ref}": {**arm, **q}
+    for base, arm in (("abe+mass", {**ARMS["abe"], **_MASS}), ("abe-hard+all", ABLATION["abe-hard+all"]))
+    for ref, q in REFERENCES.items()
+}
+ALL_ARMS = {**ARMS, **ABLATION, **SCALE}
 
 
-def domain_for(args: argparse.Namespace, family: str) -> domains.Domain:
+def domain_for(args: argparse.Namespace, family: str, length: float | None = None) -> domains.Domain:
     """The domain a cell will run on, used for its resolution and for reporting its detour ratio."""
     return domains.build(
         family,
         width=args.corridor_width,
-        length=args.corridor_length,
+        length=args.corridor_length if length is None else length,
         gap=args.corridor_gap,
         island=args.corridor_island_size,
         x0=args.corridor_x0,
@@ -111,22 +133,52 @@ def geometry_args(family: str) -> dict[str, Any]:
     )
 
 
-def cell_name(family: str, arm: str, seed: int) -> str:
-    return f"{family}_{arm}_seed{seed}"
+def cell_name(family: str, arm: str, seed: int, length: float | None = None) -> str:
+    # The length only enters the name when it is swept, so earlier result directories still resolve
+    where = family if length is None else f"{family}_l{length:g}"
+    return f"{where}_{arm}_seed{seed}"
 
 
-def grid(args: argparse.Namespace) -> list[tuple[str, str, int]]:
-    return [(f, a, s) for f in args.families for a in args.arms for s in args.seeds]
+def grid(args: argparse.Namespace) -> list[tuple[str, str, int, float | None]]:
+    lengths = getattr(args, "lengths", None) or [None]
+    return [(f, a, s, l) for f in args.families for l in lengths for a in args.arms for s in args.seeds]
 
 
-def run_cell(args: argparse.Namespace, family: str, arm: str, seed: int):
-    out = args.dir / "results" / f"{cell_name(family, arm, seed)}.json"
+def pretrain(args: argparse.Namespace):
+    """Pre-trains the base model of every seed, so array tasks only ever load it.
+
+    Without this, the first cells of a seed all train it concurrently. The write is atomic, so that
+    is not unsafe, but each cell may end up running on its own copy rather than the shared one.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for seed in args.seeds:
+        ckpt = args.dir / "base_models" / f"seed{seed}.pt"
+        if ckpt.exists():
+            print(f"skipping {ckpt.name}, already trained")
+            continue
+
+        torch.manual_seed(seed)
+        CorridorProblemSetup({**vars(args), "corridor_base_ckpt": str(ckpt)}, device=device)
+        print(f"wrote {ckpt}")
+
+
+def run_cell(args: argparse.Namespace, family: str, arm: str, seed: int, length: float | None = None):
+    name = cell_name(family, arm, seed, length)
+    out = args.dir / "results" / f"{name}.json"
     if out.exists():
         print(f"skipping {out.name}, already done")
         return
 
-    domain = domain_for(args, family)
+    domain = domain_for(args, family, length)
     overrides = dict(ALL_ARMS[arm])
+    if length is not None:
+        overrides["corridor_length"] = length
+
+    if overrides["method"] == "actflow" and args.equal_budget:
+        # ActFlow spends samples_per_iter queries a round and ABE abe_query_budget, so the same
+        # num_iters would hand them different budgets
+        overrides["num_iters"] = max(1, round(args.num_iters * args.abe_query_budget / args.samples_per_iter))
+
     if overrides.get("abe_disperse_steps") == "auto":
         # A domain with no wall reports 1, since no resolution helps there. A cost arm still needs
         # at least 2, because a single displacement has no intermediate state to charge and the
@@ -140,7 +192,7 @@ def run_cell(args: argparse.Namespace, family: str, arm: str, seed: int):
         **geometry_args(family),
         **overrides,
         "problem_setup": "corridor",
-        "dir": args.dir / "runs" / cell_name(family, arm, seed),
+        "dir": args.dir / "runs" / name,
         "seed": seed,
         # S_0 does not depend on the family, so one pre-trained model serves every cell of a seed
         "corridor_base_ckpt": str(args.dir / "base_models" / f"seed{seed}.pt"),
@@ -174,6 +226,8 @@ def run_cell(args: argparse.Namespace, family: str, arm: str, seed: int):
         "arm": arm,
         "method": method,
         "seed": seed,
+        "length": cell_args.corridor_length,
+        "reference": cell_args.abe_reference if method == "abe" else None,
         "disperse_steps": overrides.get("abe_disperse_steps", 1),
         "detour_ratio": domain.detour_ratio,
         "wall_thickness": domain.wall_thickness(),
@@ -206,13 +260,15 @@ def summarise(dir: Path):
         n = len(xs)
         return float("nan") if n == 0 else (xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2]))
 
-    families = sorted({r["family"] for r in rows})
+    # Rows from before lengths were swept carry no length, and form one group per family
+    groups = sorted({(r["family"], r.get("length")) for r in rows}, key=lambda g: (g[0], g[1] or 0))
     order = [a for a in ALL_ARMS if any(r["arm"] == a for r in rows)]
 
-    for family in families:
-        sub = [r for r in rows if r["family"] == family]
+    for family, length in groups:
+        sub = [r for r in rows if r["family"] == family and r.get("length") == length]
         ratio = sub[0]["detour_ratio"]
-        print(f"\n{family}  (detour_ratio {ratio:.2f}, wall {sub[0]['wall_thickness']:.3f})")
+        where = family if length is None else f"{family}, length {length:g}"
+        print(f"\n{where}  (detour_ratio {ratio:.2f}, wall {sub[0]['wall_thickness']:.3f})")
         width = max(10, *(len(a) for a in order))
         print(f"  {'arm':<{width}} {'steps':>5} {'solved':>7} {'queries':>9} {'clean':>7} {'shortcut':>9} "
               f"{'in A':>7} {'muCrossA':>8} {'A cross':>7} {'A dirty':>8}")
@@ -270,6 +326,12 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--arms", type=str, nargs="+", default=list(ARMS),
                          choices=list(ALL_ARMS))
         sub.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+        sub.add_argument("--lengths", type=float, nargs="+", default=None,
+                         help="Sweep --corridor_length, which is the gap on the islands")
+        sub.add_argument("--equal_budget", action="store_true",
+                         help="Scale ActFlow's num_iters so it spends as many queries as ABE")
+        sub.add_argument("--pretrain_only", action="store_true",
+                         help="Only pre-train the base model of each seed")
         sub.add_argument("--switchback_folds", type=int, default=3,
                          help="Only read when a switchback family is requested")
         sub.add_argument("--detect", type=float, default=0.9,
@@ -283,6 +345,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(args: argparse.Namespace):
+    if args.pretrain_only:
+        pretrain(args)
+        return
+
     if not args.summary_only:
         cells = grid(args)
         if args.grid_index is not None:
@@ -291,8 +357,8 @@ def main(args: argparse.Namespace):
 
             cells = [cells[args.grid_index]]
 
-        for family, arm, seed in cells:
-            run_cell(args, family, arm, seed)
+        for family, arm, seed, length in cells:
+            run_cell(args, family, arm, seed, length)
 
     if args.grid_index is None:
         summarise(args.dir)

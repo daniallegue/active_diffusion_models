@@ -224,6 +224,9 @@ experiments/
 slurm-*
 *.ipynb
 
+# slurm
+cluster/
+
 # reports
 reports/
 tests/
