@@ -1,32 +1,3 @@
-"""ActFlow vs ABE vs ABE with a path cost, on domains where the route and the shortcut disagree.
-
-`corridor_sweep` sweeps (width, length) and fits the cost of crossing a corridor. That grid cannot
-test a path cost at all: in the corridor the valid route *is* the straight line, so detour_ratio is
-exactly 1 and no state cost has anything to discriminate. This sweep varies the **arm** instead, on
-a fixed geometry, and runs each arm on domains whose detour ratio is dialled up.
-
-The arms, in increasing order of what they are allowed to know:
-
-    actflow      No reference process at all: exploration is DPS guidance on GP uncertainty inside
-                 the sampler. There is nowhere to put a path cost, which is the point of including
-                 it -- it is the baseline that can only ever see endpoints.
-    abe          Dispersal in a single displacement, then tilt. The original line 4.
-    abe-steps    The same dispersal split into `disperse_steps` increments, with no cost. A control,
-                 and a necessary one: without it any difference could be attributed to simulating
-                 the reference differently rather than to charging for the path.
-    abe-soft     V = -log P(valid) along the path, from the surrogate.
-    abe-hard     The same, and a path crossing mu + lambda sigma < 0 is pruned outright.
-
-What separates them is `final_frac_shortcut`: mass the final model puts in the forbidden band
-between S_0 and A, which can only have arrived by crossing. The prediction is that actflow and abe
-cross freely, abe-steps behaves like abe, and abe-hard does not cross but pays for it in
-`samples_to_solve`. It is a trade, not a free win, and the sweep measures its size.
-
-The resolution of each arm is read off the domain rather than guessed: `required_steps()` inverts
-the detection rate min(1, n b / d) for that domain's wall, so a thin wall automatically gets more
-increments. A domain with no wall gets 1, since no resolution helps there.
-"""
-
 from typing import Any
 import argparse
 import json
