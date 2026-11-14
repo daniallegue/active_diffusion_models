@@ -9,6 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from matplotlib import patheffects  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap, to_rgb  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 from scipy import ndimage  # noqa: E402
@@ -38,7 +39,8 @@ def style(ax, extent):
 
 def label_point(mask: np.ndarray) -> tuple[int, int]:
     """The cell deepest inside the component, so the label sits on it however it is shaped."""
-    d = ndimage.distance_transform_edt(mask)
+    # Padded so the grid border counts as the edge of a component that runs off it
+    d = ndimage.distance_transform_edt(np.pad(mask, 1))[1:-1, 1:-1]
     iy, ix = np.unravel_index(d.argmax(), d.shape)
     return iy, ix
 
@@ -94,6 +96,38 @@ def plot_islands(args, lab, rows, cls, conf, tau, extent, path):
     print(f"wrote {path}")
 
 
+def plot_island_map(args, lab, rows, tau, extent, path):
+    """The component map alone, for presenting: digit labels only, S_0 and islands in the legend."""
+    rgb = np.empty(lab.shape + (3,))
+    rgb[:] = to_rgb(INVALID_FILL)
+    for r in rows:
+        if not r["speck"]:
+            rgb[lab == r["component"]] = to_rgb(SEED_FILL if r["seed"] else ISLAND_FILL)
+
+    plt.rcParams.update({"font.size": 10})
+    fig, ax = plt.subplots(figsize=(6.4, 6.6), constrained_layout=True, facecolor=SURFACE)
+    xmin, xmax, ymin, ymax = extent
+    xs, ys = np.linspace(xmin, xmax, args.grid_res), np.linspace(ymin, ymax, args.grid_res)
+    ax.imshow(rgb, extent=extent, origin="lower", aspect="auto", interpolation="nearest")
+    ax.contour(xs, ys, np.isin(lab, [r["component"] for r in rows if not r["speck"]]), levels=[0.5],
+               colors=INK, linewidths=0.6)
+    for r in rows:
+        if r["speck"]:
+            continue
+        iy, ix = label_point(lab == r["component"])
+        ax.text(xs[ix], ys[iy], str(r["majority"]), color="#ffffff", ha="center", va="center",
+                fontsize=15 if r["area"] > 1 else 11, fontweight="bold",
+                path_effects=[patheffects.withStroke(linewidth=2.5, foreground=INK)])
+    style(ax, extent)
+    ax.set_title(f"Digit regions the verifier accepts (τ = {tau:g}); grey is rejected", color=INK, loc="left",
+                 fontsize=14)
+    ax.legend(handles=[Patch(color=SEED_FILL, label="S₀"), Patch(color=ISLAND_FILL, label="Islands")],
+              loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=2, frameon=False, fontsize=12, labelcolor=INK)
+    fig.savefig(path, dpi=200, facecolor=SURFACE)
+    plt.close(fig)
+    print(f"wrote {path}")
+
+
 @torch.no_grad()
 def plot_manifold(vae: VAE, extent, device, path, n: int = 24):
     xmin, xmax, ymin, ymax = extent
@@ -114,7 +148,7 @@ def plot_manifold(vae: VAE, extent, device, path, n: int = 24):
 # -- main ----------------------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(description="Measure the islands of Omega* in a 2-d VAE latent of MNIST")
     parser.add_argument("--data_dir", type=Path, default=Path("experiments/mnist"))
     parser.add_argument("--cache_dir", type=Path, default=Path("experiments/mnist_islands"))
     parser.add_argument("--out", type=Path, default=Path("reports/mnist_islands"))
@@ -169,6 +203,7 @@ def main(args: argparse.Namespace):
         lab, rows = label_islands(cls, conf, tau, extent, codes, labels, args.seed_classes, args.seed_min_share,
                                   args.min_cells, args.clearance)
         plot_islands(args, lab, rows, cls, conf, tau, extent, args.out / f"islands_tau{tau:g}.png")
+        plot_island_map(args, lab, rows, tau, extent, args.out / f"island_map_tau{tau:g}.png")
         all_rows += [{"tau": tau, "clearance": args.clearance, **r} for r in rows]
 
         seed_rows = [r for r in rows if r["seed"]]

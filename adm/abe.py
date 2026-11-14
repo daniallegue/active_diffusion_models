@@ -13,6 +13,9 @@ from diffusiongym import D, DDTensor, DummyReward, BaseModel, Environment, Sampl
 from diffusiongym.utils import train_base_model, dict_to_device
 from diffusiongym.base_models.one_dim_gmm import MLP
 
+from .ctmc import (
+    CLOCKS, CTMCDisperser, CTMCReference, TwistNet, fit_twist, make_clock, per_particle, positive_stable,
+)
 from .explore import ExploreLoop, build_loop, build_parser
 from .path_cost import (
     OracleStateCost, bridge_points, path_log_weight, per_step_scale, simulate_path,
@@ -34,7 +37,7 @@ class ABEConfig:
     # Reference process Q and dispersal
     step_size: float = 0.05          # eps, diffusion coefficient of Q and entropic OT regularization
     disperse_time: float = 1.0       # tau_t, time that the pool is simulated under Q
-    reference: Literal["gaussian", "student", "levy", "poisson"] = "gaussian"
+    reference: Literal["gaussian", "student", "levy", "poisson", "ctmc"] = "gaussian"  # "ctmc" jumps the problem's categorical fields
     reference_df: float = 2.0        # degrees of freedom of "student"
     reference_alpha: float = 1.5     # stability index of "levy", in (0, 2]
     disperse_steps: int = 1          # increments the dispersal of line 4 is simulated in; 1 is a single displacement
@@ -49,6 +52,23 @@ class ABEConfig:
     jump_rate: float = 0.2           # Poisson rate of jumps per unit time for "poisson"
     jump_scale: float = 1.0          # standard deviation of each jump for "poisson"
     max_jump: float = 5.0            # cap on the norm of a dispersal step, for heavy tails
+
+    # Clock of the CTMC reference, the categorical analogue of `reference`: "levy", "student" and
+    # "poisson" reuse reference_alpha, reference_df and jump_rate / jump_scale (see ctmc.make_clock)
+    ctmc_clock: Literal["gaussian", "levy", "student", "poisson"] = "gaussian"
+    # "heat" draws the clock per atom and per bond and smooths it with heat kernels of the molecule,
+    # exp(-s L0) over atoms and exp(-s L1) over bonds, so long clocks rewrite a neighbourhood
+    ctmc_topology: Literal["none", "heat"] = "none"
+    ctmc_heat_time: float = 1.0      # s
+    ctmc_heat_refresh: bool = False  # rebuild L from the current bonds every step; exact weights, inexact splitting
+
+    # Twist of the CTMC reference: a learned proposal whose correction keeps the pool's target exact
+    twist: bool = False
+    twist_steps: int = 200           # log-variance steps per round, on the round's own paths
+    twist_batch_size: int = 256      # paths per step
+    twist_lr: float = 1e-3
+    twist_hidden: int = 64
+    twist_layers: int = 3
 
     # Dispersal from the frontier of the verified positives
     frontier_frac: float = 0.5       # fraction of the pool that starts at positives instead of mu_theta
@@ -123,6 +143,24 @@ class ABEConfig:
                 "the feasibility mask of line 5 already does"
             )
 
+        if self.ctmc_clock != "gaussian" and self.reference != "ctmc":
+            raise ValueError(f"ctmc_clock={self.ctmc_clock!r} only acts on reference='ctmc'")
+
+        if self.ctmc_topology != "none" and self.reference != "ctmc":
+            raise ValueError(f"ctmc_topology={self.ctmc_topology!r} only acts on reference='ctmc'")
+
+        if self.ctmc_heat_time < 0:
+            raise ValueError(f"ctmc_heat_time must be non-negative, got {self.ctmc_heat_time}")
+
+        if self.twist and self.reference != "ctmc":
+            raise ValueError("the twist is a proposal for the CTMC reference and needs reference='ctmc'")
+
+        if self.twist and self.lineage:
+            raise ValueError(
+                "lineage re-prices ancestral paths by -int V alone, which would drop the twist's "
+                "correction from every positive's weight"
+            )
+
         if not (0 <= self.frontier_frac <= 1):
             raise ValueError(f"frontier_frac must be in [0, 1], got {self.frontier_frac}")
 
@@ -176,6 +214,17 @@ class ABELoop(ExploreLoop[D]):
         self._diag_gen = torch.Generator().manual_seed(torch.initial_seed() % 2**63)
         self._pos_clean: list[bool] = []
         self.trust_coef = self.abe.trust_coef
+
+        # The CTMC reference is frozen at the first dispersal, to the marginals of the pretrained
+        # model's samples, so that every round's weights are measured against the same process
+        self.ctmc_reference: Optional[CTMCReference] = None
+        self.twist: Optional[TwistNet] = None
+        self._ctmc_paths: Optional[tuple[Any, torch.Tensor]] = None  # (record, -int V) of the last dispersal
+        if self.abe.reference == "ctmc":
+            num_classes, _ = self.problem.categorical_fields()
+            if self.abe.twist:
+                self.twist = TwistNet(num_classes, self.abe.twist_hidden, self.abe.twist_layers).to(self.device).eval()
+                self.twist_opt = torch.optim.Adam(self.twist.parameters(), lr=self.abe.twist_lr)
         if isinstance(x, DDTensor):
             self.latent_shape = x.data.shape[1:]
 
@@ -261,7 +310,13 @@ class ABELoop(ExploreLoop[D]):
         Feynman-Kac log weight exp(-int V) that turns the pool into a sample of rho_t K^V_tau.
 
         With `disperse_steps = 1` and no state cost this is the single displacement of the original
-        line 4 and the weights are zero, so the default path through the loop is unchanged."""
+        line 4 and the weights are zero, so the default path through the loop is unchanged.
+
+        Under the CTMC reference, a twisted step's correction log p / q is added to the weight, so
+        the pool represents rho_t K^V_tau whatever the twist."""
+        if self.abe.reference == "ctmc":
+            return self.disperse_ctmc_path(x, has_data, monitor)
+
         return simulate_path(
             x,
             scale,
@@ -272,6 +327,78 @@ class ABELoop(ExploreLoop[D]):
             self.device,
             monitor,
         )
+
+    def disperse_ctmc_path(
+        self, x: D, has_data: bool, monitor: Optional[Callable[[int, D], None]] = None,
+    ) -> tuple[D, torch.Tensor, dict[str, float]]:
+        """The dispersal of line 4 under the CTMC reference, for `disperse_time` in `disperse_steps`
+        exact steps. Keeps the paths and -int V for `fit_twist_on_pool`."""
+        if self.ctmc_reference is None:
+            num_classes, rates = self.problem.categorical_fields()
+            pis = CTMCReference.marginals(self.problem.encode_categorical(x), num_classes)
+            self.ctmc_reference = CTMCReference(rates, pis, self.device)
+            self.logger.info("froze the CTMC reference: " + "; ".join(
+                f"field {f} rate {r:g} pi {[round(v, 3) for v in self.ctmc_reference.pi[f, :k].tolist()]}"
+                for f, (k, r) in enumerate(zip(num_classes, rates))
+            ))
+
+        # A Gaussian jump of std `jump_scale` is Brownian motion run for jump_scale^2 / step_size
+        # units of the reference's time, whose variance per unit is step_size
+        cfg = self.abe
+        dt = cfg.disperse_time / cfg.disperse_steps
+        clock = make_clock(
+            cfg.ctmc_clock, dt, cfg.reference_alpha, cfg.reference_df, cfg.jump_rate, cfg.jump_scale ** 2 / cfg.step_size,
+        )
+        disperser = CTMCDisperser(
+            self.ctmc_reference,
+            self.problem.encode_categorical,
+            self.problem.decode_categorical,
+            cfg.disperse_steps,
+            cfg.disperse_time,
+            self.twist,
+            clock,
+            cfg.ctmc_clock,
+            self.heat_clock_map if cfg.ctmc_topology == "heat" else None,
+            freeze_clock_map=not cfg.ctmc_heat_refresh,
+        )
+        end, fk_log_w, info = simulate_path(
+            x, 1.0, self.abe.disperse_steps, disperser, self.abe, self.state_cost(has_data), self.device, monitor,
+        )
+        self._ctmc_paths = (disperser.record, fk_log_w)
+
+        log_ratio = disperser.log_ratio if disperser.log_ratio is not None else torch.zeros_like(fk_log_w)
+        log_ratio = log_ratio.to(fk_log_w.device)
+        info["twist_log_ratio_std"] = log_ratio.std().item() if len(log_ratio) > 1 else 0.0
+        if disperser.record is not None and len(disperser.record.clocks) > 0:
+            # How far the clock's tail reaches: the share of the pool in which some coordinate ran
+            # for more than four times the nominal time, and how many coordinates changed per particle
+            record = disperser.record
+            owner, n = record.state.owner, len(record.state)
+            total_clock = torch.stack(record.clocks).sum(0)
+            longest = torch.zeros(n, device=total_clock.device).scatter_reduce(0, owner, total_clock, "amax", include_self=False)
+            changed = per_particle((record.tokens[0] != record.tokens[-1]).float(), owner, n)
+            info["clock_long"] = (longest > 4 * cfg.disperse_time).float().mean().item()
+            info["ctmc_changed"] = changed.mean().item()
+            info["ctmc_changed_max"] = changed.max().item()
+        return end, fk_log_w + log_ratio, info
+
+    def heat_clock_map(self, state: Any) -> Any:
+        return self.problem.heat_clock_map(state, self.abe.ctmc_heat_time)
+
+    def fit_twist_on_pool(self, pool_score: torch.Tensor, beta: float, feasible: torch.Tensor) -> dict[str, float]:
+        """Fits the twist on this round's paths towards the round's target, -int V + beta alpha(X_1)
+        on the feasible endpoints, i.e., the pool's own weights without the twist's correction."""
+        if self.twist is None or self._ctmc_paths is None:
+            return {}
+
+        record, fk_log_w = self._ctmc_paths
+        self._ctmc_paths = None
+        base = (fk_log_w + beta * pool_score).masked_fill(~feasible, float("-inf"))
+        loss = fit_twist(
+            self.twist, self.twist_opt, self.ctmc_reference, record, base,
+            self.abe.twist_steps, self.abe.twist_batch_size,
+        )
+        return {"twist_loss": loss}
 
     @torch.no_grad()
     def features(self, x: D) -> torch.Tensor:
@@ -747,6 +874,7 @@ class ABELoop(ExploreLoop[D]):
                 weights, beta = tilt_weights_with_offset(
                     pool_score, cfg.tilt, cfg.ess_min, path_log_w, pool_feasible, cfg.ess_over_alive
                 )
+                metrics.update(self.fit_twist_on_pool(pool_score, beta, pool_feasible))
 
                 pool_cross = None
                 if self._diagnose:
@@ -1098,17 +1226,6 @@ def sample_reference(
     return disp * (cfg.max_jump / norm).clamp(max=1.0)
 
 
-def positive_stable(a: float, n: int, device: torch.device) -> torch.Tensor:
-    """Samples of the positive a-stable law with Laplace transform exp(-s^a), for a in (0, 1], with
-    Kanter's representation."""
-    if a >= 1:
-        return torch.ones(n, device=device)
-
-    u = math.pi * torch.rand(n, device=device).clamp(1e-6, 1 - 1e-6)
-    e = torch.empty(n, device=device).exponential_()
-    return (torch.sin(a * u) / torch.sin(u) ** (1 / a)) * (torch.sin((1 - a) * u) / e) ** ((1 - a) / a)
-
-
 def effective_sample_size(weights: torch.Tensor) -> float:
     """ESS of normalized weights as a fraction of the number of particles."""
     return (1.0 / (weights.pow(2).sum() * len(weights))).item()
@@ -1189,7 +1306,26 @@ def add_abe_args(parser):
     defaults = ABEConfig()
     parser.add_argument("--abe_step_size", type=float, default=defaults.step_size, help="eps")
     parser.add_argument("--abe_disperse_time", type=float, default=defaults.disperse_time, help="tau_t")
-    parser.add_argument("--abe_reference", type=str, choices=["gaussian", "student", "levy", "poisson"], default=defaults.reference, help="Q")
+    parser.add_argument("--abe_reference", type=str, choices=["gaussian", "student", "levy", "poisson", "ctmc"], default=defaults.reference,
+                        help="Q; 'ctmc' jumps the problem's categorical fields one at a time, e.g., atoms and bonds")
+    parser.add_argument("--abe_ctmc_clock", type=str, choices=list(CLOCKS), default=defaults.ctmc_clock,
+                        help="Clock of the CTMC reference, its analogue of --abe_reference: 'levy', 'student' and 'poisson' "
+                             "reuse --abe_reference_alpha, --abe_reference_df and --abe_jump_rate / --abe_jump_scale")
+    parser.add_argument("--abe_ctmc_topology", type=str, choices=["none", "heat"], default=defaults.ctmc_topology,
+                        help="'heat' draws the CTMC clock per atom and bond and smooths it over the molecule with "
+                             "heat kernels, so long clocks rewrite a neighbourhood rather than scattered coordinates")
+    parser.add_argument("--abe_ctmc_heat_time", type=float, default=defaults.ctmc_heat_time,
+                        help="s of the heat kernels exp(-s L); 0 gives every atom and bond its own clock")
+    parser.add_argument("--abe_ctmc_heat_refresh", action="store_true",
+                        help="Rebuild the Laplacians from the current bonds every step instead of the path's start: "
+                             "weights stay exact, but the endpoint law then depends on --abe_disperse_steps")
+    parser.add_argument("--abe_twist", action="store_true",
+                        help="Learn a proposal for the CTMC reference; its correction keeps the pool's target exact")
+    parser.add_argument("--abe_twist_steps", type=int, default=defaults.twist_steps)
+    parser.add_argument("--abe_twist_batch_size", type=int, default=defaults.twist_batch_size)
+    parser.add_argument("--abe_twist_lr", type=float, default=defaults.twist_lr)
+    parser.add_argument("--abe_twist_hidden", type=int, default=defaults.twist_hidden)
+    parser.add_argument("--abe_twist_layers", type=int, default=defaults.twist_layers)
     parser.add_argument("--abe_reference_df", type=float, default=defaults.reference_df)
     parser.add_argument("--abe_reference_alpha", type=float, default=defaults.reference_alpha)
     parser.add_argument("--abe_jump_rate", type=float, default=defaults.jump_rate)

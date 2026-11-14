@@ -7,6 +7,7 @@ from matplotlib.figure import Figure
 from pathlib import Path
 from argparse import ArgumentParser
 
+from adm.ctmc import CategoricalState, ClockMap
 from adm.uncertainty import UncertaintyEstimator
 from adm.utils import Batch
 
@@ -114,6 +115,25 @@ class ProblemSetup(ABC, Generic[D]):
 
         disp = noise(len(latents), latents.data[0].numel()).to(latents.data.device)
         return DDTensor(latents.data + disp.reshape(latents.data.shape))  # type: ignore
+
+    def categorical_fields(self) -> tuple[list[int], list[float]]:
+        """The categorical fields of the latents that ABE's CTMC reference acts on: their numbers
+        of classes and their jump rates per unit `disperse_time`. Only needed for `reference="ctmc"`."""
+        raise NotImplementedError(f"{type(self).__name__} has no categorical fields for the CTMC reference")
+
+    def encode_categorical(self, latents: D) -> CategoricalState:
+        """The categorical state of the latents, in the field order of `categorical_fields`."""
+        raise NotImplementedError(f"{type(self).__name__} has no categorical fields for the CTMC reference")
+
+    def decode_categorical(self, latents: D, tokens: torch.Tensor) -> D:
+        """`latents` with their categorical coordinates set to `tokens`, on the layout of
+        `encode_categorical(latents)`. Everything else, e.g., positions, is kept."""
+        raise NotImplementedError(f"{type(self).__name__} has no categorical fields for the CTMC reference")
+
+    def heat_clock_map(self, state: CategoricalState, heat_time: float) -> ClockMap:
+        """The `ClockMap` that smooths the CTMC reference's clock over the latents' own topology
+        with heat time `heat_time`, for `ctmc_topology="heat"`, e.g., over a molecule's bonds."""
+        raise NotImplementedError(f"{type(self).__name__} has no topology for a heat clock")
 
     def distance_features(self, latents: D) -> Optional[torch.Tensor]:
         """Features in which ABE measures distances between latents, for diverse selection and

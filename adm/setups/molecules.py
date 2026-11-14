@@ -24,12 +24,15 @@ import gzip
 import os
 
 import adm.sa_scorer.sascorer as sascorer
+from adm.ctmc import CategoricalState, ClockMap, molecular_clock_map
 from adm.setups.problem_setup import ProblemSetup
 from adm.uncertainty import UncertaintyEstimator
 from adm.utils import Batch
 
 
 FINGERPRINT_SIZE = 2048
+NUM_CHARGES = 6      # formal charges -2..3, as in `_mols_to_graph`
+NUM_BOND_TYPES = 5   # the classes of flowmol's `bond_type_to_idx`, "no bond" included
 MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=FINGERPRINT_SIZE)
 
 
@@ -39,6 +42,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
 
         self.geometry_opt: str = args["mol_geometry_opt"]
         self.disperse_batch_size: int = args.get("mol_disperse_batch_size", 256)
+        self.ctmc_rates = [args.get(f"mol_ctmc_rate_{f}", r) for f, r in (("atom", 0.05), ("charge", 0.02), ("bond", 0.02))]
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,6 +61,9 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
     def add_args(cls, parser: ArgumentParser):
         parser.add_argument("--mol_geometry_opt", type=str, choices=["none", "mmff", "uff", "gfn2"], default="mmff")
         parser.add_argument("--mol_disperse_batch_size", type=int, default=256, help="Molecules regenerated at once by ABE's dispersal")
+        parser.add_argument("--mol_ctmc_rate_atom", type=float, default=0.05, help="Jumps per atom type per unit disperse_time of the CTMC reference")
+        parser.add_argument("--mol_ctmc_rate_charge", type=float, default=0.02, help="Jumps per formal charge per unit disperse_time of the CTMC reference")
+        parser.add_argument("--mol_ctmc_rate_bond", type=float, default=0.02, help="Jumps per atom pair's bond type per unit disperse_time of the CTMC reference")
 
     @property
     def base_model(self) -> BaseModel[DDGraph]:
@@ -175,6 +182,82 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
             graph.edata[key] = val
 
         return DDGraph(graph, x1.ue_mask, x1.n_idx, x1.e_idx)
+
+    @staticmethod
+    def _feature_keys(graph: dgl.DGLGraph) -> tuple[str, str, str]:
+        a_key = "a_1" if "a_1" in graph.ndata.keys() else "a_t"
+        c_key = "c_1" if "c_1" in graph.ndata.keys() else "c_t"
+        e_key = "e_1" if "e_1" in graph.edata.keys() else "e_t"
+        return a_key, c_key, e_key
+
+    def categorical_fields(self) -> tuple[list[int], list[float]]:
+        """Atom types, formal charges and bond types, which the CTMC reference changes one at a
+        time. Positions and the number of atoms are kept."""
+        return [len(self.atom_type_map), NUM_CHARGES, NUM_BOND_TYPES], list(self.ctmc_rates)
+
+    def encode_categorical(self, latents: DDGraph) -> CategoricalState:
+        """Coordinates are laid out as [atom types | charges | bonds], with one bond coordinate per
+        atom pair of the upper edge mask, i.e., including "no bond". Each atom is linked to its
+        charge and each bond to its two atoms, which is the structure the twist passes messages on."""
+        g = latents.graph
+        a_key, c_key, e_key = self._feature_keys(g)
+        device = g.ndata[a_key].device
+        ue = latents.ue_mask.bool().to(device)
+        upper = ue.nonzero().squeeze(1)
+        num_nodes, num_bonds = g.num_nodes(), len(upper)
+
+        tokens = torch.cat([
+            g.ndata[a_key].argmax(-1), g.ndata[c_key].argmax(-1), g.edata[e_key][upper].argmax(-1),
+        ])
+        field = torch.cat([
+            torch.zeros(num_nodes, dtype=torch.long, device=device),
+            torch.ones(num_nodes, dtype=torch.long, device=device),
+            torch.full((num_bonds,), 2, dtype=torch.long, device=device),
+        ])
+        n_idx, e_idx = latents.n_idx.to(device), latents.e_idx.to(device)
+        owner = torch.cat([n_idx, n_idx, e_idx[upper]])
+
+        src, dst = (v.to(device) for v in g.edges())
+        atom = torch.arange(num_nodes, device=device)
+        bond = 2 * num_nodes + torch.arange(num_bonds, device=device)
+        pairs = torch.cat([
+            torch.stack([atom, num_nodes + atom], dim=1),
+            torch.stack([bond, src[upper]], dim=1),
+            torch.stack([bond, dst[upper]], dim=1),
+        ])
+        links = torch.cat([pairs, pairs.flip(1)]).T
+
+        return CategoricalState(tokens, field, owner, links, len(latents))
+
+    def decode_categorical(self, latents: DDGraph, tokens: torch.Tensor) -> DDGraph:
+        """Writes `tokens` back as one-hot features. A bond is stored on both directed edges of its
+        atom pair, so the edge below the diagonal gets the same type as its partner above it."""
+        g = latents.graph.clone()
+        a_key, c_key, e_key = self._feature_keys(g)
+        device = g.ndata[a_key].device
+        tokens = tokens.to(device)
+        ue = latents.ue_mask.bool().to(device)
+        upper = ue.nonzero().squeeze(1)
+        num_nodes = g.num_nodes()
+
+        atoms, charges, bonds = tokens[:num_nodes], tokens[num_nodes:2 * num_nodes], tokens[2 * num_nodes:]
+        g.ndata[a_key] = F.one_hot(atoms, g.ndata[a_key].shape[-1]).type_as(g.ndata[a_key])
+        g.ndata[c_key] = F.one_hot(charges, g.ndata[c_key].shape[-1]).type_as(g.ndata[c_key])
+
+        e = g.edata[e_key].clone()
+        e[upper] = F.one_hot(bonds, e.shape[-1]).type_as(e)
+        lower = reverse_edges(g, upper)
+        found = lower >= 0
+        e[lower[found]] = e[upper[found]]
+        g.edata[e_key] = e
+
+        return DDGraph(g, latents.ue_mask, latents.n_idx, latents.e_idx)
+
+    def heat_clock_map(self, state: CategoricalState, heat_time: float) -> ClockMap:
+        """Clocks heat-smoothed over the molecule: atoms along bonds, bonds along shared atoms,
+        charges with their atom (see `adm.ctmc.molecular_clock_map`). "No bond" is flowmol's own
+        class for a missing bond, the one `_mols_to_graph` encodes it as."""
+        return molecular_clock_map(state, heat_time, no_bond=bond_type_to_idx[None])
 
     def distance_features(self, latents: DDGraph) -> torch.Tensor:
         """Morgan fingerprints, between which ABE measures Tanimoto distances. Molecules that RDKit
@@ -391,6 +474,17 @@ class QM9ProblemSetup(MoleculeProblemSetup):
 class GEOMDrugsProblemSetup(MoleculeProblemSetup):
     def __init__(self, args: dict, device: Optional[torch.device] = None):
         super().__init__(dataset="geom_drugs", args=args, device=device)
+
+
+def reverse_edges(g: dgl.DGLGraph, edges: torch.Tensor) -> torch.Tensor:
+    """The id of the edge v -> u for every edge u -> v of `edges`, or -1 where the graph has none."""
+    src, dst = g.edges()
+    n = g.num_nodes()
+    keys = src.long() * n + dst.long()
+    sorted_keys, perm = keys.sort()
+    want = dst[edges].long() * n + src[edges].long()
+    pos = torch.searchsorted(sorted_keys, want).clamp(max=len(keys) - 1)
+    return torch.where(sorted_keys[pos] == want, perm[pos], torch.full_like(pos, -1))
 
 
 def per_graph(x: DDGraph, values: torch.Tensor) -> DDGraph:

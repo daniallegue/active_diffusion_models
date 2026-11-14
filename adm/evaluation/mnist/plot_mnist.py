@@ -13,6 +13,8 @@ import torch  # noqa: E402
 import yaml  # noqa: E402
 from diffusiongym import DDTensor  # noqa: E402
 from matplotlib.colors import to_rgb  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
 
 from adm.setups.mnist_latent import MNISTLatentProblemSetup  # noqa: E402
 
@@ -96,12 +98,16 @@ def plot_coverage(rows, island_class, new, path):
                 ax.fill_between(grid, lo, hi, color=SLOTS[slot], alpha=0.14, lw=0, step="post")
 
             ax.set_ylim(-0.3, top + 0.3)
-            ax.set_ylabel(f"{ylabel} (of {top})", color=INK)
+            ax.tick_params(labelsize=11)
+            # The right column shares the left one's y-axis, so only the left one names it
+            if j == 0:
+                ax.set_ylabel(f"{ylabel} (of {top})", color=INK, fontsize=13)
             if i == 0:
-                ax.set_title(title, color=INK, loc="left", fontsize=9.5)
-                ax.legend(frameon=False, fontsize=8, labelcolor=INK, loc="upper left")
+                ax.set_title(title, color=INK, loc="left", fontsize=14)
+                # ABE climbs fast in the upper left of the right panel, so its legend sits below
+                ax.legend(frameon=False, fontsize=11, labelcolor=INK, loc="upper left" if j == 0 else "lower right")
             else:
-                ax.set_xlabel("verifier queries", color=INK)
+                ax.set_xlabel("verifier queries", color=INK, fontsize=13)
 
     fig.savefig(path, dpi=160, facecolor=SURFACE)
     plt.close(fig)
@@ -169,38 +175,42 @@ def snapshot(dir: Path, row: dict, q: int) -> torch.Tensor:
     return torch.load(run / "eval" / f"{q // row['per_round']:04d}" / "samples.pt")
 
 
-def island_map(problem: MNISTLatentProblemSetup, hit: set[int]) -> np.ndarray:
+S0_FILL, ISLAND_FILL = "#9ec5f4", "#f5b494"
+
+
+def island_map(problem: MNISTLatentProblemSetup) -> np.ndarray:
     rgb = np.empty(problem.lab.shape + (3,))
     rgb[:] = to_rgb("#ecebe7")
-    rgb[np.isin(problem.lab, [r["component"] for r in problem.components if r["seed"]])] = to_rgb("#9ec5f4")
-    rgb[np.isin(problem.lab, [r["component"] for r in problem.islands])] = to_rgb("#f8cdb9")
-    rgb[np.isin(problem.lab, list(hit))] = to_rgb("#eb6834")
+    rgb[np.isin(problem.lab, [r["component"] for r in problem.components if r["seed"]])] = to_rgb(S0_FILL)
+    rgb[np.isin(problem.lab, [r["component"] for r in problem.islands])] = to_rgb(ISLAND_FILL)
     return rgb
 
 
-def plot_process(dir, rows, problem, seed, path):
-    arms = [a for a in PROCESS_ARMS if any(r["arm"] == a and r["seed"] == seed for r in rows)]
-    fig, axes = plt.subplots(len(arms), len(SNAPSHOTS), figsize=(2.6 * len(SNAPSHOTS), 2.5 * len(arms)),
-                             constrained_layout=True, facecolor=SURFACE, squeeze=False)
+def plot_process(dir, rows, problem, seed, out: Path):
+    """One figure per arm: its model samples and the queries since the previous snapshot."""
     island_ids = {r["component"] for r in problem.islands}
-    for i, arm in enumerate(arms):
+    background = island_map(problem)
+    legend = [Patch(color=S0_FILL, label="S₀"), Patch(color=ISLAND_FILL, label="Island"),
+              Line2D([], [], ls="none", marker="o", ms=8, color=VALID, label="accepted point"),
+              Line2D([], [], ls="none", marker="x", ms=9, mew=2, color=REJECTED, label="rejected point")]
+    for arm in [a for a in ARMS if any(r["arm"] == a and r["seed"] == seed for r in rows)]:
         row = next(r for r in rows if r["arm"] == arm and r["seed"] == seed)
+        fig, axes = plt.subplots(1, len(SNAPSHOTS), figsize=(3.2 * len(SNAPSHOTS), 4.3), constrained_layout=True,
+                                 facecolor=SURFACE)
         prev = 0
-        for j, q in enumerate(SNAPSHOTS):
-            ax = axes[i, j]
+        for ax, q in zip(axes, SNAPSHOTS):
             done = [t for t in row["trace"] if int(t["queried"]) <= q]
             window = [t for t in done if int(t["queried"]) > prev]
             hit = {c for t in done for c in t["comp"][t["valid"]].tolist() if c in island_ids}
-            ax.imshow(island_map(problem, hit), extent=problem.extent, origin="lower", aspect="auto",
-                      interpolation="nearest")
+            ax.imshow(background, extent=problem.extent, origin="lower", aspect="auto", interpolation="nearest")
 
             z = snapshot(dir, row, q).numpy()
-            ax.scatter(z[:, 0], z[:, 1], s=0.6, color=INK, alpha=0.35, lw=0, rasterized=True)
+            ax.scatter(z[:, 0], z[:, 1], s=0.8, color=INK, alpha=0.3, lw=0, rasterized=True)
             if window:
                 zq = torch.cat([t["z"] for t in window]).numpy()
                 ok = torch.cat([t["valid"] for t in window]).numpy()
-                ax.scatter(zq[ok, 0], zq[ok, 1], s=7, color=VALID, lw=0)
-                ax.scatter(zq[~ok, 0], zq[~ok, 1], s=9, color=REJECTED, marker="x", lw=0.8)
+                ax.scatter(zq[ok, 0], zq[ok, 1], s=16, color=VALID, lw=0)
+                ax.scatter(zq[~ok, 0], zq[~ok, 1], s=22, color=REJECTED, marker="x", lw=1.3)
 
             ax.set_xlim(problem.extent[0], problem.extent[1])
             ax.set_ylim(problem.extent[2], problem.extent[3])
@@ -208,17 +218,15 @@ def plot_process(dir, rows, problem, seed, path):
             ax.set_yticks([])
             for side in ax.spines.values():
                 side.set_color(MUTED)
-            ax.set_title(f"{q} queries · {len(hit)} islands", color=INK, fontsize=8.5, loc="left")
-            if j == 0:
-                ax.set_ylabel(ARMS[arm][0], color=INK, fontsize=9)
+            ax.set_title(f"{q} queries\n{len(hit)} islands reached", color=INK, fontsize=14, loc="left")
             prev = q
 
-    fig.suptitle(f"Sampling process, seed {seed}: S₀ blue, islands orange (dark once hit), model samples black, "
-                 f"queries since the last column green (valid) and red (rejected)", color=INK, fontsize=9.5,
-                 x=0.01, ha="left")
-    fig.savefig(path, dpi=160, facecolor=SURFACE)
-    plt.close(fig)
-    print(f"wrote {path}")
+        fig.legend(handles=legend, loc="outside upper center", ncol=4, frameon=False, fontsize=14,
+                   labelcolor=INK, title=ARMS[arm][0], title_fontsize=17)
+        path = out / f"mnist_process_{arm.replace('+', '_').replace('@', '_')}.png"
+        fig.savefig(path, dpi=160, facecolor=SURFACE)
+        plt.close(fig)
+        print(f"wrote {path}")
 
 
 @torch.no_grad()
@@ -252,7 +260,7 @@ def plot_digits(dir, rows, problem, seed, path, n: int = 12):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(description="Figures of the MNIST islands sweep")
     parser.add_argument("--dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, default=Path("reports/mnist_islands/figures"))
     parser.add_argument("--process_seed", type=int, default=0)
@@ -270,7 +278,7 @@ def main():
     plot_coverage(rows, island_class, new, args.out / "mnist_coverage.png")
     table = island_hits(rows, sorted(problem.islands, key=lambda r: r["gap"]))
     plot_gap_hit(rows, table, args.out / "mnist_gap_hit.png")
-    plot_process(args.dir, rows, problem, args.process_seed, args.out / "mnist_process.png")
+    plot_process(args.dir, rows, problem, args.process_seed, args.out)
     plot_digits(args.dir, rows, problem, args.process_seed, args.out / "mnist_digits.png")
 
     path = args.out / "mnist_islands.csv"
