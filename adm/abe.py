@@ -102,7 +102,10 @@ class ABEConfig:
     distill_filter: Literal["lcb", "none"] = "lcb"
     safety_weight: float = 0.1       # lambda_s, x is confidently valid iff mu(x) - lambda_s sigma(x) >= 0
     mix_weight: float = 0.5          # alpha, only used by the "rollback" trust region
-    trust: Literal["penalty", "rollback", "none"] = "penalty"  # adaptive Girsanov KL penalty, rollback of chunks past rho, or none
+    # "penalty": adaptive Girsanov KL penalty; "rollback": rollback of chunks past rho; "mixture":
+    # plain flow matching on alpha M_1 + (1 - alpha) mu_theta with alpha = 1 - exp(-rho), which
+    # bounds KL(mu_theta || target) <= rho in closed form; "none": no trust region
+    trust: Literal["penalty", "rollback", "mixture", "none"] = "penalty"
     trust_radius: float = 0.1        # rho
     trust_coef: float = 1.0          # mu, initial weight of the "penalty", adapted to hit rho
     trust_direction: Literal["reverse", "forward"] = "reverse"  # KL(mu_theta || mu_theta') or KL(mu_theta' || mu_theta)
@@ -130,8 +133,11 @@ class ABEConfig:
         if not (0 <= self.mix_weight <= 1):
             raise ValueError(f"mix_weight must be in [0, 1], got {self.mix_weight}")
 
-        if self.trust == "penalty" and self.trust_direction != "reverse":
-            raise ValueError("the penalty trust region requires trust_direction='reverse'")
+        if self.trust in ("penalty", "mixture") and self.trust_direction != "reverse":
+            raise ValueError(f"the {self.trust} trust region requires trust_direction='reverse'")
+
+        if self.trust == "mixture" and self.trust_radius <= 0:
+            raise ValueError(f"the mixture trust region needs trust_radius > 0, got {self.trust_radius}")
 
         if self.disperse_steps < 1:
             raise ValueError(f"disperse_steps must be at least 1, got {self.disperse_steps}")
@@ -169,6 +175,13 @@ class ABEConfig:
 
         if self.query_budget > self.proposal_size:
             raise ValueError(f"query_budget ({self.query_budget}) cannot exceed proposal_size ({self.proposal_size})")
+
+    @property
+    def mixture_alpha(self) -> float:
+        """Weight of the bridge endpoints in the "mixture" target. The target q = alpha M_1 +
+        (1 - alpha) mu_theta satisfies q >= (1 - alpha) mu_theta everywhere, so
+        KL(mu_theta || q) <= -log(1 - alpha), which is rho for alpha = 1 - exp(-rho)."""
+        return 1.0 - math.exp(-self.trust_radius)
 
     @staticmethod
     def construct_from_args(args: argparse.Namespace | dict) -> "ABEConfig":
@@ -615,12 +628,22 @@ class ABELoop(ExploreLoop[D]):
 
         return band, left
 
-    def distill(self, bridge_endpoints: D, positives: D) -> dict[str, Any]:
+    def distill(self, bridge_endpoints: D, positives: D, anchor: Optional[D] = None) -> dict[str, Any]:
         """Distills the bridge endpoints into the flow model for `ft_steps` within a trust region of
         radius rho on the Girsanov KL between the path measures of the old and new model (`path_kl`),
-        by default KL(P_old || P_new), which only penalizes losing mass that the old model had."""
+        by default KL(P_old || P_new), which only penalizes losing mass that the old model had.
+
+        `anchor` are samples of the current model to reuse as the anchor, e.g., the pool's
+        sources, which this round already drew. Any shortfall is sampled."""
         n = self.abe.distill_size
-        anchor = self.sample_model(n - len(bridge_endpoints))
+        num_anchor = n - len(bridge_endpoints)
+        if anchor is None:
+            anchor = self.sample_model(num_anchor)
+        else:
+            k = min(len(anchor), num_anchor)
+            anchor = take(anchor, torch.randperm(len(anchor))[:k])
+            if k < num_anchor:
+                anchor = cat([anchor, self.sample_model(num_anchor - k)])
         info: dict[str, Any] = {}
 
         if self.abe.distill_filter == "lcb":
@@ -630,7 +653,12 @@ class ABELoop(ExploreLoop[D]):
             info["safe_anchor"] = safe_anchor.float().mean().item() if len(anchor) > 0 else 0.0
 
             bridge_pool = cat([take(bridge_endpoints, safe_endpoints.nonzero().squeeze(1)), positives])
-            anchor_pool = take(anchor, safe_anchor.nonzero().squeeze(1)) if safe_anchor.any() else bridge_pool
+            if self.abe.trust == "mixture":
+                # The bound needs the anchor to be mu_theta itself: filtering it would leave the
+                # target with no mass wherever mu_theta is unsafe, and KL(mu_theta || q) infinite
+                anchor_pool = anchor
+            else:
+                anchor_pool = take(anchor, safe_anchor.nonzero().squeeze(1)) if safe_anchor.any() else bridge_pool
             if len(bridge_pool) == 0:
                 bridge_pool = anchor_pool
 
@@ -645,6 +673,14 @@ class ABELoop(ExploreLoop[D]):
 
         target = cat([bridge_endpoints, anchor])
         target_latents = target.to("cpu")
+
+        if self.abe.trust == "mixture":
+            return {
+                **info,
+                **self.distill_mixture(target_latents),
+                "target": target,
+                "target_bridge": len(bridge_endpoints),
+            }
 
         opt = torch.optim.AdamW(
             self.base_model.parameters(),
@@ -698,6 +734,39 @@ class ABELoop(ExploreLoop[D]):
             "target": target,
             "target_bridge": len(bridge_endpoints),
         }
+
+    def distill_mixture(self, target: D) -> dict[str, Any]:
+        """Trains the flow model on `target` = alpha M_1 + (1 - alpha) mu_theta by plain flow
+        matching for `ft_steps`, the same update as ActFlow's fine-tune. The trust region sits in
+        the target instead of the loss: the target minimizes KL(M_1 || p) + mu KL(mu_theta || p)
+        for alpha = 1 / (1 + mu), and KL(mu_theta || target) <= -log(1 - alpha) = rho.
+
+        The bound is on the target's marginal. The fitted model can exceed it, e.g., by overfitting
+        a small target, so the Girsanov KL of the new model is measured once at the end for the
+        log, unless distill_check_every is 0. Nothing is rolled back or adapted."""
+        measure = self.abe.distill_check_every > 0
+        old_model = copy.deepcopy(self.base_model).eval().requires_grad_(False) if measure else None
+
+        opt = torch.optim.AdamW(
+            self.base_model.parameters(),
+            lr=self.config.ft_lr,
+            weight_decay=self.config.ft_weight_decay,
+        )
+        train_base_model(
+            self.base_model,
+            opt,
+            [target],
+            steps=self.config.ft_steps,
+            batch_size=self.config.ft_batch_size,
+            accumulate_steps=self.config.ft_accumulate_steps,
+            pbar=False,
+        )
+        self.base_model.eval()
+
+        info: dict[str, Any] = {"distill_steps": self.config.ft_steps, "mixture_alpha": self.abe.mixture_alpha}
+        if old_model is not None:
+            info["distill_moved"] = self.path_kl(old_model, self.base_model)
+        return info
 
     def distill_penalized(self, target: D, old_model: BaseModel[D]) -> dict[str, Any]:
         """Trains the flow model on `target` for `ft_steps` with the loss
@@ -964,7 +1033,12 @@ class ABELoop(ExploreLoop[D]):
 
             # Distill the bridge into the flow model (line 12)
             with self._timer("finetune"):
-                num_bridge = round(cfg.mix_weight * cfg.distill_size) if cfg.trust == "rollback" else cfg.distill_size
+                if cfg.trust == "rollback":
+                    num_bridge = round(cfg.mix_weight * cfg.distill_size)
+                elif cfg.trust == "mixture":
+                    num_bridge = round(cfg.mixture_alpha * cfg.distill_size)
+                else:
+                    num_bridge = cfg.distill_size
                 distill_positives = self.positives(batches)
                 distill_weights = target_weights
                 if cfg.lineage:
@@ -974,7 +1048,10 @@ class ABELoop(ExploreLoop[D]):
                     metrics.update(lineage_info)
 
                 bridge_endpoints = self.propose(num_bridge, target, distill_weights)
-                distilled = self.distill(bridge_endpoints, distill_positives)
+                # The mixture's anchor reuses the pool's model samples, drawn before this round's
+                # fine-tune, so it costs no extra sampling. Other modes keep their own draw.
+                anchor = source if cfg.trust == "mixture" else None
+                distilled = self.distill(bridge_endpoints, distill_positives, anchor=anchor)
                 metrics.update({k: v for k, v in distilled.items() if k not in ("target", "target_bridge")})
                 if self._diagnose:
                     history.append({k: metrics[k] for k in HISTORY_KEYS if k in metrics})
@@ -1370,7 +1447,7 @@ def add_abe_args(parser):
     parser.add_argument("--abe_distill_filter", type=str, choices=["lcb", "none"], default=defaults.distill_filter)
     parser.add_argument("--abe_safety_weight", type=float, default=defaults.safety_weight, help="lambda_s")
     parser.add_argument("--abe_mix_weight", type=float, default=defaults.mix_weight, help="alpha")
-    parser.add_argument("--abe_trust", type=str, choices=["penalty", "rollback", "none"], default=defaults.trust)
+    parser.add_argument("--abe_trust", type=str, choices=["penalty", "rollback", "mixture", "none"], default=defaults.trust)
     parser.add_argument("--abe_trust_radius", type=float, default=defaults.trust_radius, help="rho")
     parser.add_argument("--abe_trust_coef", type=float, default=defaults.trust_coef, help="mu")
     parser.add_argument("--abe_trust_direction", type=str, choices=["reverse", "forward"], default=defaults.trust_direction)
